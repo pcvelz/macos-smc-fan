@@ -2,7 +2,7 @@
 //  Config.generated.swift
 //  SMCFan
 //
-//  Created by Alex Goodkind <alex@goodkind.io> on 2026-01-18.
+//  Created by Alexander Goodkind <alex@goodkind.io> on 2026-01-18.
 //  Copyright © 2026, all rights reserved.
 //
 //  Committed defaults for SwiftPM builds. Xcode builds may replace via Scripts/generate-config.sh.

@@ -2,7 +2,7 @@
 //  BuildInfo.swift
 //  AppLog
 //
-//  Created by Alex Goodkind <alex@goodkind.io> on 2026-01-18.
+//  Created by Alexander Goodkind <alex@goodkind.io> on 2026-01-18.
 //  Copyright © 2026, all rights reserved.
 //
 //  Moved from SMCFanLogging/LogBootstrap.swift.
