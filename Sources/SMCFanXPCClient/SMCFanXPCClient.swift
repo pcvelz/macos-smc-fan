@@ -36,6 +36,8 @@ public struct SMCXPCTransportError: LocalizedError, Sendable {
   }
 }
 
+// MARK: - SMCXPCConnectionInvalidatedError
+
 /// Thrown when a request scope's connection was invalidated because the
 /// helper endpoint disappeared or the client shut down. Distinct from
 /// CancellationError, which only ever means the caller cancelled the work.
@@ -44,7 +46,9 @@ public struct SMCXPCConnectionInvalidatedError: LocalizedError, Sendable {
     "SMC helper connection was invalidated"
   }
 
-  public init() {}
+  public init() {
+    // Public no-op; this error type has no stored state.
+  }
 }
 
 /// Thrown when a sync call exceeds its bounded wait.
