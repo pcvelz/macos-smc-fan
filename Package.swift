@@ -20,6 +20,8 @@ let package = Package(
     .library(name: "SMCFanXPCClient", targets: ["SMCFanXPCClient"]),
     .library(name: "SMCFanHelperCore", targets: ["SMCFanHelperCore"]),
     .executable(name: "smcfan", targets: ["smcfan"]),
+    .executable(name: "smcread", targets: ["smcread"]),
+    .executable(name: "smcfand", targets: ["smcfand"]),
   ],
   dependencies: [
     .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
@@ -87,6 +89,30 @@ let package = Package(
         "SMCFanXPCClient",
       ],
       path: "Sources/CLI",
+      swiftSettings: [
+        .enableUpcomingFeature("StrictConcurrency")
+      ]
+    ),
+    .executableTarget(
+      name: "smcread",
+      dependencies: [
+        "AppLog",
+        "SMCKit",
+        "SMCFanKit",
+      ],
+      path: "Sources/SMCRead",
+      swiftSettings: [
+        .enableUpcomingFeature("StrictConcurrency")
+      ]
+    ),
+    .executableTarget(
+      name: "smcfand",
+      dependencies: [
+        "AppLog",
+        "SMCKit",
+        "SMCFanKit",
+      ],
+      path: "Sources/SMCFand",
       swiftSettings: [
         .enableUpcomingFeature("StrictConcurrency")
       ]

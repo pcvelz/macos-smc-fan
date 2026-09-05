@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.llama-cm.smcfand</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/libexec/smcfand</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- SIGTERM handling is polled (2s loop, then up to ~10s for the Ftst
+       release), so give launchd an explicit budget before it SIGKILLs. -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/smcfan/smcfand.stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/smcfan/smcfand.stderr.log</string>
+
+  <!-- Root LaunchDaemon: needed to write SMC fan keys. smcfand itself
+       fails safe to auto on startup, on a stale/missing/unparseable
+       desired.json, and on SIGTERM/SIGINT (see Sources/SMCFand/main.swift). -->
+</dict>
+</plist>

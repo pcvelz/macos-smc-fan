@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+#
+# smcfan-ctl - writes /tmp/smcfan/desired.json for smcfand to pick up on
+# its next 2s poll, and refreshes the heartbeat. Does NOT touch the SMC
+# itself; it only talks to smcfand through the control file. Requires no
+# privilege (smcfand, running as root, owns all actual SMC writes).
+#
+# Usage:
+#   smcfan-ctl auto
+#   smcfan-ctl ramp <sensor: cpu_core_average|gpu_cluster_average> <min_c> <max_c>
+#   smcfan-ctl constant <rpm>
+#   smcfan-ctl full
+#   smcfan-ctl status
+#   smcfan-ctl heartbeat   # re-touch the heartbeat on the current desired.json
+#                          # without changing mode; run this from cron/a loop
+#                          # at an interval well under 60s to keep a ramp or
+#                          # constant policy alive - smcfand fails safe to
+#                          # auto once the heartbeat goes stale.
+#
+set -euo pipefail
+
+CONTROL_DIR="/tmp/smcfan"
+DESIRED_FILE="${CONTROL_DIR}/desired.json"
+SMCREAD_BIN="${SMCREAD_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.build/out/Products/Release/smcread}"
+
+mkdir -p "$CONTROL_DIR"
+
+heartbeat_now() {
+  # Unix epoch seconds as a float, matching smcfand's DesiredState.heartbeat.
+  date +%s
+}
+
+write_desired() {
+  local json="$1"
+  printf '%s\n' "$json" > "${DESIRED_FILE}.tmp"
+  mv "${DESIRED_FILE}.tmp" "$DESIRED_FILE"
+}
+
+usage() {
+  echo "Usage: smcfan-ctl auto|ramp <sensor> <min_c> <max_c>|constant <rpm>|full|status" >&2
+  exit 2
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  auto)
+    write_desired "{\"mode\":\"auto\",\"heartbeat\":$(heartbeat_now)}"
+    echo "smcfan-ctl: requested auto"
+    ;;
+
+  ramp)
+    sensor="${2:-}"
+    min_c="${3:-}"
+    max_c="${4:-}"
+    if [[ -z "$sensor" || -z "$min_c" || -z "$max_c" ]]; then
+      echo "Usage: smcfan-ctl ramp <sensor> <min_c> <max_c>" >&2
+      exit 2
+    fi
+    write_desired "{\"mode\":\"ramp\",\"sensor\":\"${sensor}\",\"minC\":${min_c},\"maxC\":${max_c},\"heartbeat\":$(heartbeat_now)}"
+    echo "smcfan-ctl: requested ramp sensor=${sensor} ${min_c}C-${max_c}C"
+    ;;
+
+  constant)
+    rpm="${2:-}"
+    if [[ -z "$rpm" ]]; then
+      echo "Usage: smcfan-ctl constant <rpm>" >&2
+      exit 2
+    fi
+    write_desired "{\"mode\":\"constant\",\"rpm\":${rpm},\"heartbeat\":$(heartbeat_now)}"
+    echo "smcfan-ctl: requested constant ${rpm} RPM"
+    ;;
+
+  full)
+    write_desired "{\"mode\":\"full\",\"heartbeat\":$(heartbeat_now)}"
+    echo "smcfan-ctl: requested full blast"
+    ;;
+
+  heartbeat)
+    if [[ ! -f "$DESIRED_FILE" ]]; then
+      echo "smcfan-ctl: no desired.json to refresh; run auto/ramp/constant/full first" >&2
+      exit 1
+    fi
+    updated=$(sed -E "s/\"heartbeat\":[0-9.]+/\"heartbeat\":$(heartbeat_now)/" "$DESIRED_FILE")
+    write_desired "$updated"
+    ;;
+
+  status)
+    echo "--- desired.json ---"
+    if [[ -f "$DESIRED_FILE" ]]; then
+      cat "$DESIRED_FILE"
+      echo
+    else
+      echo "(no desired.json - smcfand is running in fail-safe auto)"
+    fi
+    echo "--- smcread fans ---"
+    if [[ -x "$SMCREAD_BIN" ]]; then
+      "$SMCREAD_BIN" fans
+    else
+      echo "smcread binary not found at ${SMCREAD_BIN}; build with: swift build -c release --product smcread" >&2
+    fi
+    ;;
+
+  *)
+    usage
+    ;;
+esac
