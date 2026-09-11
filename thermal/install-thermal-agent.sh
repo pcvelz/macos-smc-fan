@@ -71,6 +71,14 @@ case "${1:-}" in
       | grep -E "state =|last exit|pid =" || echo "$LABEL: not loaded"
     exit 0
     ;;
+  "")
+    ;;
+  *)
+    # A mistyped flag must not fall through to a full reinstall.
+    echo "unknown option: $1" >&2
+    echo "usage: $(basename "$0") [--uninstall|--status|--install-sidecar|--uninstall-sidecar]" >&2
+    exit 1
+    ;;
 esac
 
 mkdir -p "$DEST" "$LOGDIR" "$DEST/hooks"
