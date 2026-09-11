@@ -10,6 +10,8 @@
 
 import Foundation
 
+/// Aggregates of several temperature sensors that ignore implausible
+/// readings, such as power-gated cores reporting a few degrees Celsius.
 public enum SensorAggregate {
 
   /// Readings at or below this are not a temperature of running silicon.

@@ -25,7 +25,7 @@ public final class TemperatureSmoother {
 
   private let tau: TimeInterval
   private var smoothed: Float?
-  private var lastSampleTime: Date?
+  private var lastSampleTime: TimeInterval?
 
   /// - Parameter tau: time constant in seconds. `0` disables smoothing (the
   ///   output tracks the raw input on every sample).
@@ -44,11 +44,20 @@ public final class TemperatureSmoother {
   /// - Otherwise blends the new sample in with `alpha = min(1, dt / tau)`,
   ///   where `dt` is the elapsed time since the previous sample. `tau == 0`
   ///   makes `alpha` always `1`, i.e. no smoothing.
+  /// - A sample whose time does not advance past the previous one is ignored
+  ///   and the current value is returned unchanged.
   ///
+  /// - Parameters:
+  ///   - raw: the raw reading, or `nil` when no plausible reading exists.
+  ///   - now: a monotonic timestamp in seconds. Defaults to
+  ///     `ProcessInfo.processInfo.systemUptime`, which a wall-clock
+  ///     adjustment cannot move backwards.
   /// - Returns: the smoothed value, or `nil` if there has never been a
   ///   plausible sample.
   @discardableResult
-  public func update(_ raw: Float?, now: Date = Date()) -> Float? {
+  public func update(
+    _ raw: Float?, now: TimeInterval = ProcessInfo.processInfo.systemUptime
+  ) -> Float? {
     guard let raw else { return smoothed }
 
     guard let previous = smoothed, let lastTime = lastSampleTime else {
@@ -57,12 +66,15 @@ public final class TemperatureSmoother {
       return smoothed
     }
 
-    let dt = now.timeIntervalSince(lastTime)
+    let dt = now - lastTime
+    // A non-advancing timestamp would give alpha <= 0 and re-base the next
+    // interval on the wrong time; hold the value instead.
+    guard dt > 0 else { return previous }
     let alpha: Float
     if tau <= 0 {
       alpha = 1
     } else {
-      alpha = Float(min(1, max(0, dt / tau)))
+      alpha = Float(min(1, dt / tau))
     }
 
     let next = previous + alpha * (raw - previous)
