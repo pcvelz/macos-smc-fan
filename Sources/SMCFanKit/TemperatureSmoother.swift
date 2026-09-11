@@ -2,20 +2,18 @@
 //  TemperatureSmoother.swift
 //  SMCFanKit
 //
-//  Pure, testable exponential smoothing for the ramp's temperature input.
-//  cpu_core_average jumps >=5C in ~40% of 2s polls and >=10C in ~17% on the
-//  live box (P-core power-gating noise, not real thermal swings - see
-//  SensorAggregate), so feeding the raw reading straight into the linear
-//  ramp swings the fan target ~1500 RPM every poll. An EMA with a ~20s time
-//  constant, measured offline against an hour of real readings, cut
-//  >=300 RPM/poll steps from 685/1369 to 35 and >=800 RPM steps from 439 to
-//  0. No SMC access, no side effects - directly unit testable.
+//  Exponential smoothing for a temperature that feeds a fan curve.
+//  On an M4 Pro, cpu_core_average sampled every 2s jumps >=5C in ~40% of
+//  polls and >=10C in ~17% (P-core power-gating noise, not real thermal
+//  swings), so a raw reading on a linear curve swings the fan target up to
+//  ~1500 RPM per poll. A ~20s time constant, replayed against an hour of
+//  real readings, cut >=300 RPM/poll steps from 685/1369 to 35 and
+//  >=800 RPM steps from 439 to 0. No SMC access, no side effects.
 //
-//  Elapsed-time based, not a fixed per-call alpha: the daemon's poll
-//  interval is nominally 2s but is not guaranteed exact (scheduling jitter,
-//  a caller with a different interval), so alpha is derived from the actual
-//  elapsed time between samples: alpha = min(1, dt / tau). tau == 0 disables
-//  smoothing (alpha is always 1, output tracks input exactly).
+//  Elapsed-time based, not a fixed per-call alpha: a poll interval is not
+//  guaranteed exact (scheduling jitter, callers with different intervals),
+//  so alpha is derived from the elapsed time between samples:
+//  alpha = min(1, dt / tau). tau == 0 disables smoothing.
 //
 
 import Foundation

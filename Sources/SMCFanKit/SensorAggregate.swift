@@ -2,9 +2,10 @@
 //  SensorAggregate.swift
 //  SMCFanKit
 //
-//  The one place the cpu_core_average / gpu_cluster_average numbers are
-//  computed, shared by smcread (reporting) and smcfand (the ramp input), so
-//  the two can never disagree. Pure math, unit tested.
+//  Averages a set of temperature sensors (e.g. the CPU core sensors behind a
+//  cpu_core_average), dropping implausible readings, so every consumer that
+//  reports or acts on the aggregate gets the same number. Pure math, unit
+//  tested.
 //
 
 import Foundation
