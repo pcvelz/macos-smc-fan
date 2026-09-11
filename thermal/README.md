@@ -6,9 +6,9 @@
 |---|---|
 | `controller.sh` | the policy: reads sensors, drives the internal fans and an optional external fan |
 | `thermal.conf.example` | every config key, documented; copy to `~/.config/smcfan/thermal.conf` and edit |
-| `install-thermal-agent.sh` | installs the LaunchAgent (controller) and LaunchDaemon (powermetrics sidecar) |
+| `install-thermal-agent.sh` | installs the LaunchAgents (controller, `smcfan-rampd`) and LaunchDaemon (powermetrics sidecar) |
 | `fan-commands.zsh` | shell commands (`fan-auto`, `fan-off`, `fan-status`) that drive the installed agent |
-| `com.smcfan.thermal-controller.plist` / `com.smcfan.powermetrics-sidecar.plist` | LaunchAgent/LaunchDaemon templates the installer fills in and copies |
+| `com.smcfan.thermal-controller.plist` / `com.smcfan.smcfan-rampd.plist` / `com.smcfan.powermetrics-sidecar.plist` | LaunchAgent/LaunchDaemon templates the installer fills in and copies |
 | `tests/` | hermetic bash tests - no real sensor, no real actuator, `DRY_RUN=1` throughout |
 
 Runtime state (log, hysteresis counters, the machine-readable state snapshot, the
@@ -20,17 +20,18 @@ created on first run.
 `controller.sh loop` ticks every `POLL_INTERVAL` seconds and drives TWO
 actuators off two signals:
 
-- **The internal MacBook fans**, via the `smcfan-ctl`/`smcfand` root daemon in
+- **The internal MacBook fans**, via `smcfan-ctl`/`smcfand`/`smcfan-rampd` in
   this repo (see below) - `ramp` (a linear min-to-max-RPM curve over a
   configurable sensor and temperature range) on load, `auto` (stock) on idle.
   Driven by GPU utilisation OR CPU power - either signal engages it, both must
   cool to release it. Internal actuation is **best-effort**: a missing or
   wedged `smcfan-ctl` logs and returns 0, degrading to external-fan-only (if
   configured) rather than killing the loop. The ramp's temperature input is
-  smoothed by `smcfand` with an exponential moving average (`SMCFAN_SMOOTH_S`,
-  default 20s) before it hits the curve - `cpu_core_average` jumps >=5C on
-  power-gated-core noise in a large fraction of 2s polls, and unsmoothed that
-  swings the fan target ~1500 RPM every poll; `0` disables smoothing.
+  smoothed by `smcfan-rampd` with an exponential moving average
+  (`SMCFAN_SMOOTH_S`, default 20s) before it hits the curve - `cpu_core_average`
+  jumps >=5C on power-gated-core noise in a large fraction of 2s polls, and
+  unsmoothed that swings the fan target ~1500 RPM every poll; `0` disables
+  smoothing.
 - **An optional external fan**, driven by whatever command you configure
   (`EXTERNAL_ON_CMD` / `EXTERNAL_OFF_CMD` / `EXTERNAL_STATUS_CMD` in
   `thermal.conf` - see `thermal.conf.example`). Driven by GPU utilisation
@@ -122,7 +123,7 @@ bash controller.sh probe              # print sensor readings only, no action
 Fan control needs BOTH pieces:
 
 ```
-bash install-thermal-agent.sh                    # LaunchAgent: the controller (no password)
+bash install-thermal-agent.sh                    # LaunchAgents: the controller + smcfan-rampd (no password)
 bash install-thermal-agent.sh --install-sidecar  # LaunchDaemon: the CPU-power signal (NEEDS password)
 bash install-thermal-agent.sh --status           # is the controller loaded?
 ```
@@ -130,6 +131,7 @@ bash install-thermal-agent.sh --status           # is the controller loaded?
 | Piece | Kind | Why |
 |---|---|---|
 | `com.smcfan.thermal-controller` | LaunchAgent (user) | runs `controller.sh loop` at login |
+| `com.smcfan.smcfan-rampd` | LaunchAgent (user) | turns a ramp request into `smcfand` `constant` writes - see below; installed by the same no-arg command |
 | `com.smcfan.powermetrics-sidecar` | LaunchDaemon (root) | produces `/tmp/t1-powermetrics-smc.log` (CPU power) |
 
 - **The sidecar needs root** (`powermetrics` does), so it is a LaunchDaemon
@@ -156,35 +158,41 @@ bash install-thermal-agent.sh --status           # is the controller loaded?
 
 ## The internal-fan backend: smcfan
 
-Internal fans are driven by this repo's own daemon (see the top-level
-README and `docs/ORIGIN.md`). Three pieces:
+Internal fans are driven by this repo's own daemon + agent (see the
+top-level README and `docs/ORIGIN.md`). Four pieces - only `smcfand` needs
+root:
 
 | Piece | Privilege | Role |
 |---|---|---|
 | `smcread` | none | in-process AppleSMC reads: temp sensors, `cpu_core_average` / `gpu_cluster_average` aggregates, per-fan actual/target/min/max RPM and mode |
-| `smcfand` | root LaunchDaemon | the ONLY SMC writer. Polls `/tmp/smcfan/desired.json` every 2s: `auto`, `ramp <sensor> <min_c> <max_c>` (linear min RPM -> max RPM), `constant <rpm>`, `full`. Starts in auto, reverts to auto on SIGTERM, on a missing/unparseable file, or when the file's heartbeat is older than 60s |
-| `smcfan-ctl` | none | writes `desired.json` (`auto\|ramp\|constant\|full\|heartbeat\|status`) |
+| `smcfan-ctl` | none | writes the control files (`auto\|ramp\|constant\|full\|heartbeat\|status`) |
+| `smcfan-rampd` | LaunchAgent (user) | reads a `ramp` request from `/tmp/smcfan/ramp.json`, reads + smooths the sensor in-process, computes a target RPM (linear min RPM -> max RPM), and asks `smcfand` for it via `desired.json` as `constant <rpm>` |
+| `smcfand` | root LaunchDaemon | the ONLY SMC writer. Polls `/tmp/smcfan/desired.json` every 2s: `auto`, `constant <rpm>` (clamped to each fan's own range), `full`. Holds no sensor/curve/smoothing logic at all - `ramp` and any unrecognised mode fail safe to `auto`. Starts in auto, reverts to auto on SIGTERM, on a missing/unparseable file, or when the file's heartbeat is older than 60s (`auto` itself needs no heartbeat) |
 
 `controller.sh` calls `smcfan-ctl ramp $SMCFAN_SENSOR $SMCFAN_MIN_C
-$SMCFAN_MAX_C` or `smcfan-ctl auto`, and every tick feeds the daemon's
-heartbeat while the ramp is wanted. A dead controller therefore hands the fans
-back to macOS within a minute.
+$SMCFAN_MAX_C` (a REQUEST to `smcfan-rampd`, writing `ramp.json`) or
+`smcfan-ctl auto`, and every tick feeds that request's heartbeat while the
+ramp is wanted. A dead controller therefore hands the fans back to macOS
+within a minute either way.
 
-`desired.json` only records what was ASKED, so a missing or dead daemon under
-a wanted ramp would otherwise cool on the external fan alone (if any) with
-nothing in the log. While the ramp is wanted the daemon appends an `applied`
-line every 2s poll, so `controller.sh` treats a stale/missing daemon log as
-"nothing actuates" and logs ONE `smcfand NOT ALIVE` line (latched; one `ALIVE
-again` on recovery).
+`ramp.json` only records what was ASKED, so a missing/dead `smcfand` or
+`smcfan-rampd` under a wanted ramp would otherwise cool on the external fan
+alone (if any) with nothing in the log. `smcfand` rewrites
+`/tmp/smcfan/status.json` every 2s poll regardless of mode (its own log only
+gets a line on a state CHANGE), so `controller.sh` treats a stale/missing
+status, or a fresh status whose `mode` has not yet reached `constant`, as
+"nothing actuates" and logs ONE `smcfand NOT ALIVE` line (latched; one
+`ALIVE again` on recovery).
 
-Cutover (the ONE privileged step is the daemon install; do it by hand):
+Cutover (the ONE privileged step is the root daemon install; do it by hand -
+everything else, including `smcfan-rampd`, is unprivileged):
 
 ```
 cd ..
-swift build -c release                # smcread + smcfand
+swift build -c release                # smcread + smcfand + smcfan-rampd
 sudo bash Scripts/install-smcfand.sh  # root LaunchDaemon, once
 tail -f /tmp/smcfan/smcfand.log       # expect "startup: all fans set to auto"
-bash thermal/install-thermal-agent.sh
+bash thermal/install-thermal-agent.sh # controller + smcfan-rampd LaunchAgents
 ```
 
 ## Tests

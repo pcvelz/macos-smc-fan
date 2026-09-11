@@ -33,7 +33,8 @@ FAIL() { echo "FAIL:  $*"; fail=$((fail + 1)); }
 _HERMETIC_DIR=$(mktemp -d)
 export THERMAL_CONF="$_HERMETIC_DIR/no-such-thermal.conf"
 export SMCFAN_DESIRED="$_HERMETIC_DIR/no-such-desired.json"
-export SMCFAN_LOG="$_HERMETIC_DIR/no-such-smcfand.log"
+export SMCFAN_RAMP="$_HERMETIC_DIR/no-such-ramp.json"
+export SMCFAN_STATUS="$_HERMETIC_DIR/no-such-status.json"
 
 # CPU load levels come from the measured distribution documented inline in
 # controller.sh. QUIET_MW is an idle-ish desktop that must never ramp.
@@ -315,7 +316,8 @@ run_tick_smcfan() {
     DRY_RUN=0 \
     SMCFAN_CTL="$dir/smcfan-ctl" \
     SMCFAN_DESIRED="$dir/desired.json" \
-    SMCFAN_LOG="$dir/smcfand.log" \
+    SMCFAN_RAMP="$dir/ramp.json" \
+    SMCFAN_STATUS="$dir/status.json" \
     PRESSURE_LOG="$dir/sidecar.log" \
     GPU_UTIL_SRC="$dir/gpu-util.ioreg" \
     STATE_DIR="$dir/state" \
@@ -357,9 +359,11 @@ else
 fi
 
 # ---- Case M: ramp requested, daemon dead -> ONE loud NOT ALIVE line --------
+# "requested" is seeded in ramp.json (what we ASK smcfan-rampd for); no
+# status.json at all means smcfand itself has never even polled.
 dir=$(setup_scenario "$GPU_IDLE_PCT" "$BUSY_MW"); setup_smcfan "$dir"
 seed_state "$dir" 0 1
-echo '{"mode":"ramp","sensor":"cpu_core_average","minC":45,"maxC":75,"heartbeat":0}' > "$dir/desired.json"
+echo '{"mode":"ramp","sensor":"cpu_core_average","minC":45,"maxC":75,"heartbeat":0}' > "$dir/ramp.json"
 out1=$(run_tick_smcfan "$dir"); out2=$(run_tick_smcfan "$dir")
 if grep -q "smcfand NOT ALIVE" <<<"$out1" && ! grep -q "smcfand NOT ALIVE" <<<"$out2"; then
     PASS "M: dead smcfand under a wanted ramp is reported once (latched)"
@@ -368,30 +372,45 @@ else
     echo "--- tick1 ---"; echo "$out1"; echo "--- tick2 ---"; echo "$out2"; echo "-------------"
 fi
 
-# ---- Case N: daemon polling (fresh log) -> no false alarm, heartbeat fed ---
+# ---- Case N: daemon polling (fresh status, mode=constant) -> no false
+# alarm, heartbeat fed --------------------------------------------------------
 dir=$(setup_scenario "$GPU_IDLE_PCT" "$BUSY_MW"); setup_smcfan "$dir"
 seed_state "$dir" 0 1
-echo '{"mode":"ramp","sensor":"cpu_core_average","minC":45,"maxC":75,"heartbeat":0}' > "$dir/desired.json"
-echo "ramp: cpu_core_average=70.0C applied to 2 fans" > "$dir/smcfand.log"
+echo '{"mode":"ramp","sensor":"cpu_core_average","minC":45,"maxC":75,"heartbeat":0}' > "$dir/ramp.json"
+echo "{\"ts\":$(date +%s),\"mode\":\"constant\",\"fans\":[]}" > "$dir/status.json"
 out=$(run_tick_smcfan "$dir")
 if ! grep -q "smcfand NOT ALIVE" <<<"$out"; then
-    PASS "N: live smcfand (fresh log) raises no liveness alarm"
+    PASS "N: live smcfand (fresh status, mode=constant) raises no liveness alarm"
 else
     FAIL "N: live smcfand flagged NOT ALIVE"
     echo "--- tick output ---"; echo "$out"; echo "-------------------"
 fi
 
-# ---- Case O: stale log (> liveness window) while ramp wanted -> alarm -------
+# ---- Case O: stale status ts (> liveness window) while ramp wanted -> alarm -
 dir=$(setup_scenario "$GPU_IDLE_PCT" "$BUSY_MW"); setup_smcfan "$dir"
 seed_state "$dir" 0 1
-echo '{"mode":"ramp","sensor":"cpu_core_average","minC":45,"maxC":75,"heartbeat":0}' > "$dir/desired.json"
-echo "ramp: cpu_core_average=70.0C applied to 2 fans" > "$dir/smcfand.log"
-touch -t "$(date -v-5M +%Y%m%d%H%M.%S)" "$dir/smcfand.log"
+echo '{"mode":"ramp","sensor":"cpu_core_average","minC":45,"maxC":75,"heartbeat":0}' > "$dir/ramp.json"
+stale_ts=$(( $(date +%s) - 300 ))
+echo "{\"ts\":${stale_ts},\"mode\":\"constant\",\"fans\":[]}" > "$dir/status.json"
 out=$(run_tick_smcfan "$dir")
-if grep -q "smcfand NOT ALIVE (log [0-9]*s stale)" <<<"$out"; then
-    PASS "O: stale smcfand log under a wanted ramp raises the liveness alarm"
+if grep -q "smcfand NOT ALIVE (status [0-9]*s stale)" <<<"$out"; then
+    PASS "O: stale smcfand status under a wanted ramp raises the liveness alarm"
 else
-    FAIL "O: stale smcfand log not flagged"
+    FAIL "O: stale smcfand status not flagged"
+    echo "--- tick output ---"; echo "$out"; echo "-------------------"
+fi
+
+# ---- Case O2: fresh status but mode still "auto" (rampd hasn't caught up to
+# the request yet) -> also flagged, distinctly from a stale/missing status --
+dir=$(setup_scenario "$GPU_IDLE_PCT" "$BUSY_MW"); setup_smcfan "$dir"
+seed_state "$dir" 0 1
+echo '{"mode":"ramp","sensor":"cpu_core_average","minC":45,"maxC":75,"heartbeat":0}' > "$dir/ramp.json"
+echo "{\"ts\":$(date +%s),\"mode\":\"auto\",\"fans\":[]}" > "$dir/status.json"
+out=$(run_tick_smcfan "$dir")
+if grep -q "smcfand NOT ALIVE (status mode=auto (want constant))" <<<"$out"; then
+    PASS "O2: fresh status stuck at mode=auto under a wanted ramp raises the liveness alarm"
+else
+    FAIL "O2: fresh status stuck at mode=auto was not flagged"
     echo "--- tick output ---"; echo "$out"; echo "-------------------"
 fi
 

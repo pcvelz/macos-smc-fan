@@ -82,15 +82,18 @@ _load_config
 DRY_RUN="${DRY_RUN:-1}"
 INTERNAL_FAN_ENABLED="${INTERNAL_FAN_ENABLED:-1}"   # 0 disables the internal ramp only
 
-# The internal fans are driven by a companion root daemon (smcfand, from this
-# same repo): the controller only writes a desired-state file via smcfan-ctl,
-# the daemon owns every SMC write and falls back to auto by itself when its
-# heartbeat goes stale (60s). Because of that dead-man switch the loop
-# refreshes the heartbeat on every tick while the ramp is wanted, so a dead
-# controller hands the fans back to macOS within a minute.
+# The internal fans are driven by two companion pieces from this same repo:
+# smcfand (root daemon, the only SMC writer - auto/constant/full only, no
+# ramp logic) and smcfan-rampd (unprivileged agent that turns a ramp REQUEST
+# into smcfand `constant` writes). The controller only ever writes a request
+# via smcfan-ctl; it never talks to either backend directly. Both backends
+# fall back to auto by themselves when a heartbeat goes stale (60s), so the
+# loop refreshes the heartbeat on every tick while the ramp is wanted - a
+# dead controller hands the fans back to macOS within a minute either way.
 SMCFAN_CTL="${SMCFAN_CTL:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/Scripts/smcfan-ctl}"
 SMCFAN_DESIRED="${SMCFAN_DESIRED:-/tmp/smcfan/desired.json}"
-SMCFAN_LOG="${SMCFAN_LOG:-/tmp/smcfan/smcfand.log}"       # daemon appends every 2s poll while ramping
+SMCFAN_RAMP="${SMCFAN_RAMP:-/tmp/smcfan/ramp.json}"        # the ramp REQUEST, read by smcfan-rampd
+SMCFAN_STATUS="${SMCFAN_STATUS:-/tmp/smcfan/status.json}"  # smcfand's own liveness signal, rewritten every 2s poll
 SMCFAN_LIVENESS_SECONDS="${SMCFAN_LIVENESS_SECONDS:-30}"  # > several 2s polls, < the 60s dead-man
 SMCFAN_SENSOR="${SMCFAN_SENSOR:-cpu_core_average}"        # sensor the ramp targets
 SMCFAN_MIN_C="${SMCFAN_MIN_C:-45}"
@@ -292,17 +295,27 @@ set_external_fan() {
     bash -c "$cmd" 2>&1 | while read -r l; do log "  external: $l"; done
 }
 
-# "ramp" = smcfand's linear min-max sensor curve, "stock" = auto (firmware
-# control), read straight from the desired-state file so an external change
-# (someone running smcfan-ctl by hand) is seen rather than assumed.
+# "ramp" = a live ramp REQUEST is on file for smcfan-rampd, "stock" = auto
+# (firmware control), read straight from the control files so an external
+# change (someone running smcfan-ctl by hand) is seen rather than assumed.
+#
+# The ramp desire itself now lives in ramp.json, not desired.json - smcfand
+# has no concept of "ramp" any more (see Sources/SMCFand/main.swift), only
+# smcfan-rampd does. A ramp.json present and not explicitly marked auto means
+# "we want ramp" regardless of what desired.json currently says, since the
+# agent may not have caught up to the request yet.
 internal_fan_state() {
-    # No desired file means the daemon sits in its fail-safe auto state.
+    if [[ -f "$SMCFAN_RAMP" ]] && ! grep -q '"mode":"auto"' "$SMCFAN_RAMP" 2>/dev/null; then
+        echo "ramp"
+        return
+    fi
+    # No desired file means smcfand sits in its fail-safe auto state.
     [[ -f "$SMCFAN_DESIRED" ]] || { echo "stock"; return; }
     case "$(grep -o '"mode":"[a-z]*"' "$SMCFAN_DESIRED" 2>/dev/null)" in
-        '"mode":"ramp"') echo "ramp" ;;
         '"mode":"auto"') echo "stock" ;;
         '')              echo "unknown" ;;
-        *)               echo "other" ;;   # constant/full set by hand - leave alone
+        *)               echo "other" ;;   # constant/full - our own ramp-derived
+                                            # value, or set by hand - leave alone
     esac
 }
 
@@ -360,22 +373,36 @@ smcfan_heartbeat() {
     return 0
 }
 
-# The desired file only says what we ASKED for. If smcfand is not installed,
-# not running, or wedged, "ramp" in that file actuates nothing and the box
-# cools on the external fan alone (if any) - silently, unless someone checks.
-# While the ramp is wanted the daemon appends a "ramp: ... applied" line every
-# 2s poll, so a log older than SMCFAN_LIVENESS_SECONDS (or missing) means no
-# daemon is behind the request. Latched via a state file: one DEAD line when
-# it stops, one ALIVE line when it comes back, never a line per tick.
+# ramp.json only says what we ASKED for. If smcfand or smcfan-rampd is not
+# installed, not running, or wedged, that request actuates nothing and the
+# box cools on the external fan alone (if any) - silently, unless someone
+# checks. smcfand rewrites status.json every 2s poll regardless of mode, so a
+# status.json older than SMCFAN_LIVENESS_SECONDS (or missing) means the
+# daemon itself is dead; a fresh status.json whose mode is not yet
+# "constant" means the daemon is alive but the ramp REQUEST has not been
+# applied yet (typically smcfan-rampd not running, or not yet caught up).
+# Latched via a state file: one DEAD line when it stops, one ALIVE line when
+# it comes back, never a line per tick.
 smcfan_liveness_check() {
-    local age now mtime prev="" cur
-    if [[ -f "$SMCFAN_LOG" ]]; then
+    local age now ts mode prev="" cur
+    if [[ -f "$SMCFAN_STATUS" ]]; then
         now=$(date +%s)
-        mtime=$(stat -f %m "$SMCFAN_LOG" 2>/dev/null || echo 0)
-        age=$(( now - mtime ))
-        (( age <= SMCFAN_LIVENESS_SECONDS )) && cur="alive" || cur="dead:log ${age}s stale"
+        ts=$(grep -o '"ts":[0-9]*' "$SMCFAN_STATUS" 2>/dev/null | head -1 | grep -o '[0-9]*$')
+        mode=$(grep -o '"mode":"[a-z]*"' "$SMCFAN_STATUS" 2>/dev/null | head -1 | sed -E 's/.*:"//; s/"//')
+        if [[ -n "$ts" ]]; then
+            age=$(( now - ts ))
+            if (( age > SMCFAN_LIVENESS_SECONDS )); then
+                cur="dead:status ${age}s stale"
+            elif [[ "$mode" != "constant" ]]; then
+                cur="dead:status mode=${mode:-unknown} (want constant)"
+            else
+                cur="alive"
+            fi
+        else
+            cur="dead:status.json missing ts field"
+        fi
     else
-        cur="dead:no log at $SMCFAN_LOG"
+        cur="dead:no status at $SMCFAN_STATUS"
     fi
     [[ -f "$STATE_DIR/smcfand_liveness" ]] && prev=$(cat "$STATE_DIR/smcfand_liveness")
     if [[ "${cur%%:*}" != "${prev%%:*}" ]]; then

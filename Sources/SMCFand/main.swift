@@ -3,15 +3,27 @@
 //  smcfand
 //
 //  Privileged (root) fan-control daemon. Reads a desired-state JSON file
-//  written by `smcfan-ctl`, applies a ramp/constant/full/auto policy to
+//  written by `smcfan-ctl`/`smcfan-rampd`, applies auto/constant/full to
 //  every fan, and fails safe to auto whenever the desired state is
-//  missing, unparseable, or stale. Intended to run under a LaunchDaemon
-//  (see LaunchDaemon/com.llama-cm.smcfand.plist); NOT executed by any
+//  missing, unparseable, stale, or names a mode this daemon does not
+//  understand. Intended to run under a LaunchDaemon (see
+//  LaunchDaemon/com.llama-cm.smcfand.plist); NOT executed by any
 //  automation in this repo - the one-time `launchctl bootstrap` install
 //  is a manual, documented, sudo step (Scripts/install-smcfand.sh).
 //
+//  This daemon is SMC-writer only - it holds no sensor-reading, smoothing,
+//  or ramp-curve logic at all (that lives in the unprivileged
+//  Sources/SMCRampAgent, which computes a target RPM and asks for it via
+//  `constant`, same as a human would). Keeping this half of the split this
+//  small is the point: the root LaunchDaemon should change so rarely that a
+//  reinstall (which needs sudo) becomes a non-event.
+//
 //  Control file: /tmp/smcfan/desired.json (see ORIGIN.md "Control
-//  surface" for the exact schema). Log file: /tmp/smcfan/smcfand.log.
+//  surface" for the exact schema). Log file: /tmp/smcfan/smcfand.log,
+//  written only on a state CHANGE (never once per 2s poll) to keep it
+//  from growing unbounded while a policy is held steady. Status file:
+//  /tmp/smcfan/status.json, rewritten every poll - this, not the log, is
+//  the liveness signal a consumer (thermal/controller.sh) should watch.
 //
 
 import Foundation
@@ -23,6 +35,7 @@ import SMCKit
 private let controlDir = "/tmp/smcfan"
 private let desiredStatePath = controlDir + "/desired.json"
 private let logPath = controlDir + "/smcfand.log"
+private let statusPath = controlDir + "/status.json"
 private let pollInterval: TimeInterval = 2.0
 private let staleHeartbeatSeconds: TimeInterval = 60.0
 
@@ -67,66 +80,69 @@ func logLine(_ message: String) {
 
 struct DesiredState: Codable {
   var mode: String
-  var sensor: String?
-  var minC: Double?
-  var maxC: Double?
   var rpm: Double?
   var heartbeat: Double?
-  var smoothS: Double?
 }
 
-enum ResolvedMode {
+/// Everything this daemon can DO to a fan. Sensor curves ("ramp") are not a
+/// case here on purpose - smcfand has no sensor-reading or smoothing logic
+/// left; a curve is computed by smcfan-rampd and arrives as `constant`.
+enum ResolvedMode: Equatable {
   case auto
-  case ramp(sensor: String, minC: Double, maxC: Double, smoothS: Double)
   case constant(rpm: Double)
   case full
 }
 
-/// Default EMA time constant (seconds) when desired.json omits `smoothS`.
-/// Matches Scripts/smcfan-ctl's default so a ctl caller that leaves the arg
-/// off gets the same smoothing the daemon assumes.
-private let defaultSmoothS: Double = 20
+struct Resolution {
+  let mode: ResolvedMode
+  let reason: String
+}
 
-func resolveDesiredMode() -> ResolvedMode {
+/// Interprets desired.json into what this daemon should actually do.
+/// `auto` needs no heartbeat at all - it is always safe and never stale.
+/// `constant`/`full` are the only modes gated by the heartbeat dead-man
+/// switch, since they are the only modes that keep a fan pinned away from
+/// firmware control. Any mode this daemon does not implement (including
+/// `ramp`, which now belongs to smcfan-rampd, and any unrecognised string)
+/// fails safe to auto.
+func resolveDesiredMode() -> Resolution {
   guard let data = FileManager.default.contents(atPath: desiredStatePath) else {
-    logLine("desired.json missing -> auto (fail-safe)")
-    return .auto
+    return Resolution(mode: .auto, reason: "desired.json missing")
   }
   guard let state = try? JSONDecoder().decode(DesiredState.self, from: data) else {
-    logLine("desired.json unparseable -> auto (fail-safe)")
-    return .auto
-  }
-  if let heartbeat = state.heartbeat {
-    let age = Date().timeIntervalSince1970 - heartbeat
-    if age > staleHeartbeatSeconds {
-      logLine("heartbeat stale (\(Int(age))s) -> auto (fail-safe)")
-      return .auto
-    }
-  } else {
-    logLine("desired.json missing heartbeat -> auto (fail-safe)")
-    return .auto
+    return Resolution(mode: .auto, reason: "desired.json unparseable")
   }
 
   switch state.mode {
   case "auto":
-    return .auto
-  case "ramp":
-    guard let sensor = state.sensor, let minC = state.minC, let maxC = state.maxC else {
-      logLine("ramp mode missing sensor/minC/maxC -> auto (fail-safe)")
-      return .auto
-    }
-    return .ramp(sensor: sensor, minC: minC, maxC: maxC, smoothS: state.smoothS ?? defaultSmoothS)
+    return Resolution(mode: .auto, reason: "requested auto")
+
   case "constant":
     guard let rpm = state.rpm else {
-      logLine("constant mode missing rpm -> auto (fail-safe)")
-      return .auto
+      return Resolution(mode: .auto, reason: "constant mode missing rpm")
     }
-    return .constant(rpm: rpm)
+    guard let heartbeat = state.heartbeat,
+      Date().timeIntervalSince1970 - heartbeat <= staleHeartbeatSeconds
+    else {
+      return Resolution(mode: .auto, reason: "constant requested but heartbeat missing/stale")
+    }
+    return Resolution(mode: .constant(rpm: rpm), reason: "requested constant \(Int(rpm)) RPM")
+
   case "full":
-    return .full
+    guard let heartbeat = state.heartbeat,
+      Date().timeIntervalSince1970 - heartbeat <= staleHeartbeatSeconds
+    else {
+      return Resolution(mode: .auto, reason: "full requested but heartbeat missing/stale")
+    }
+    return Resolution(mode: .full, reason: "requested full")
+
   default:
-    logLine("unknown mode '\(state.mode)' -> auto (fail-safe)")
-    return .auto
+    // Includes "ramp" (owned by smcfan-rampd now, not this daemon) and any
+    // unrecognised string - both fail safe to auto rather than guessing.
+    return Resolution(
+      mode: .auto,
+      reason:
+        "mode '\(state.mode)' not understood by smcfand (ramp curves are computed by smcfan-rampd, applied here as constant) -> auto")
   }
 }
 
@@ -212,36 +228,71 @@ final class DaemonFanWriter {
       setFanAuto(fan: fan)
     }
   }
+}
 
-  func averageTemperature(sensorName: String) -> Float? {
-    let allKeys = SensorCatalog.keysForCurrentHardware().filter { $0.type == .temperature }
-    let group: SensorGroup?
-    switch sensorName {
-    case "cpu_core_average": group = .cpu
-    case "gpu_cluster_average": group = .gpu
-    default: group = nil
-    }
-    guard let group else { return nil }
+/// Clamps a requested RPM to one fan's own [F%dMn, F%dMx] range. A degenerate
+/// reading (max not strictly above min - e.g. an SMC read glitch returning
+/// 0/0) means the hardware range is not trustworthy this poll, so the
+/// request is passed through unclamped rather than forced to a guessed value.
+func clampToFanRange(_ rpm: Float, minRPM: Float, maxRPM: Float) -> Float {
+  guard maxRPM > minRPM else { return rpm }
+  return Swift.min(Swift.max(rpm, minRPM), maxRPM)
+}
 
-    var values: [Float] = []
-    for sensor in allKeys where sensor.group == group {
-      guard let (bytes, size) = try? connection.readKey(sensor.key) else { continue }
-      values.append(SMCDataFormat.float(from: bytes, size: size))
-    }
-    // Shared with smcread; drops power-gated cores that report 2-3C, which
-    // would otherwise pin the ramp at min RPM under load (see SensorAggregate).
-    return SensorAggregate.average(values)
+/// A dedupe key for the log: distinct only when what the daemon is actually
+/// DOING changes (mode, and target RPM for `constant`). Different fail-safe
+/// REASONS for landing on the same mode (missing file vs stale heartbeat vs
+/// an unknown mode string) collapse to the same key on purpose - the log
+/// line for entering that state carries the reason, but re-entering it for a
+/// different reason is not a new state.
+func stateKey(_ mode: ResolvedMode) -> String {
+  switch mode {
+  case .auto: return "auto"
+  case .full: return "full"
+  case let .constant(rpm): return "constant:\(Int(rpm))"
   }
 }
 
-// MARK: - Ramp temperature smoothing
+func modeName(_ mode: ResolvedMode) -> String {
+  switch mode {
+  case .auto: return "auto"
+  case .full: return "full"
+  case .constant: return "constant"
+  }
+}
 
-// Rebuilt whenever the ramp's sensor or requested tau changes, or the
-// daemon leaves/re-enters ramp mode - carrying a stale EMA across a
-// mode/sensor switch would blend readings from an unrelated stream.
-private var rampSmoother = TemperatureSmoother(tau: defaultSmoothS)
-private var lastRampSensor: String?
-private var lastRampSmoothS: Double?
+// MARK: - Status file (the liveness signal; written every poll regardless of
+// whether the log line changed, so a consumer can always tell the daemon is
+// alive and see the fans it is currently asking for)
+
+struct FanStatusEntry: Codable {
+  let index: Int
+  let targetRPM: Float
+  let actualRPM: Float
+}
+
+struct DaemonStatus: Codable {
+  let ts: Int
+  let mode: String
+  let fans: [FanStatusEntry]
+}
+
+func writeStatus(mode: String, writer: DaemonFanWriter, fanCount: Int) {
+  var fans: [FanStatusEntry] = []
+  for fan in 0..<fanCount {
+    let target = writer.readFloat(SMCFanKey.target, fan: fan)
+    let actual = writer.readFloat(SMCFanKey.actual, fan: fan)
+    fans.append(FanStatusEntry(index: fan, targetRPM: target, actualRPM: actual))
+  }
+  let status = DaemonStatus(ts: Int(Date().timeIntervalSince1970), mode: mode, fans: fans)
+  guard let data = try? JSONEncoder().encode(status) else { return }
+
+  ensureControlDir()
+  let tmpPath = statusPath + ".tmp"
+  FileManager.default.createFile(atPath: tmpPath, contents: data)
+  try? FileManager.default.removeItem(atPath: statusPath)
+  try? FileManager.default.moveItem(atPath: tmpPath, toPath: statusPath)
+}
 
 // MARK: - Signal handling (fail-safe on termination)
 
@@ -264,65 +315,40 @@ guard let writer = try? DaemonFanWriter() else {
 writer.setAllFansAuto()
 logLine("startup: all fans set to auto")
 
-while !shouldExit {
-  let mode = resolveDesiredMode()
-  let fanCount = writer.fanCount()
+private var lastStateKey: String?
 
-  if case let .ramp(sensorName, _, _, smoothS) = mode {
-    // Reset the smoother across a sensor or tau change, or on re-entering
-    // ramp after any other mode - never blend across an unrelated stream.
-    if lastRampSensor != sensorName || lastRampSmoothS != smoothS {
-      rampSmoother = TemperatureSmoother(tau: smoothS)
-      lastRampSensor = sensorName
-      lastRampSmoothS = smoothS
-    }
-  } else if lastRampSensor != nil {
-    rampSmoother.reset()
-    lastRampSensor = nil
-    lastRampSmoothS = nil
+while !shouldExit {
+  let resolution = resolveDesiredMode()
+  let fanCount = writer.fanCount()
+  let key = stateKey(resolution.mode)
+
+  if key != lastStateKey {
+    logLine("state -> \(key) (\(resolution.reason))")
+    lastStateKey = key
   }
 
-  switch mode {
+  switch resolution.mode {
   case .auto:
     for fan in 0..<fanCount where writer.isManual(fan: fan) {
       writer.setFanAuto(fan: fan)
-      logLine("fan\(fan): set to auto")
     }
-
-  case let .ramp(sensorName, minC, maxC, _):
-    guard let rawTemperature = writer.averageTemperature(sensorName: sensorName) else {
-      logLine("ramp: sensor '\(sensorName)' unavailable -> auto (fail-safe)")
-      for fan in 0..<fanCount where writer.isManual(fan: fan) {
-        writer.setFanAuto(fan: fan)
-      }
-      break
-    }
-    let temperature = rampSmoother.update(rawTemperature) ?? rawTemperature
-    for fan in 0..<fanCount {
-      let minRPM = writer.readFloat(SMCFanKey.minimum, fan: fan)
-      let maxRPM = writer.readFloat(SMCFanKey.maximum, fan: fan)
-      let target = FanRamp.targetRPM(
-        temperatureC: temperature, minC: Float(minC), maxC: Float(maxC), minRPM: minRPM,
-        maxRPM: maxRPM)
-      writer.setFanRPM(fan: fan, rpm: target)
-    }
-    logLine(
-      "ramp: \(sensorName) raw=\(String(format: "%.1f", rawTemperature))C "
-        + "smoothed=\(String(format: "%.1f", temperature))C applied to \(fanCount) fans")
 
   case let .constant(rpm):
     for fan in 0..<fanCount {
-      writer.setFanRPM(fan: fan, rpm: Float(rpm))
+      let minRPM = writer.readFloat(SMCFanKey.minimum, fan: fan)
+      let maxRPM = writer.readFloat(SMCFanKey.maximum, fan: fan)
+      let clamped = clampToFanRange(Float(rpm), minRPM: minRPM, maxRPM: maxRPM)
+      writer.setFanRPM(fan: fan, rpm: clamped)
     }
-    logLine("constant: \(Int(rpm)) RPM applied to \(fanCount) fans")
 
   case .full:
     for fan in 0..<fanCount {
       let maxRPM = writer.readFloat(SMCFanKey.maximum, fan: fan)
       writer.setFanRPM(fan: fan, rpm: maxRPM)
     }
-    logLine("full: max RPM applied to \(fanCount) fans")
   }
+
+  writeStatus(mode: modeName(resolution.mode), writer: writer, fanCount: fanCount)
 
   Thread.sleep(forTimeInterval: pollInterval)
 }

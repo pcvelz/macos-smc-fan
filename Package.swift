@@ -22,6 +22,7 @@ let package = Package(
     .executable(name: "smcfan", targets: ["smcfan"]),
     .executable(name: "smcread", targets: ["smcread"]),
     .executable(name: "smcfand", targets: ["smcfand"]),
+    .executable(name: "smcfan-rampd", targets: ["smcfan-rampd"]),
   ],
   dependencies: [
     .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
@@ -113,6 +114,18 @@ let package = Package(
         "SMCFanKit",
       ],
       path: "Sources/SMCFand",
+      swiftSettings: [
+        .enableUpcomingFeature("StrictConcurrency")
+      ]
+    ),
+    .executableTarget(
+      name: "smcfan-rampd",
+      dependencies: [
+        "AppLog",
+        "SMCKit",
+        "SMCFanKit",
+      ],
+      path: "Sources/SMCRampAgent",
       swiftSettings: [
         .enableUpcomingFeature("StrictConcurrency")
       ]

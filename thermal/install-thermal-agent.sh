@@ -34,6 +34,13 @@ SIDECAR_LABEL="com.smcfan.powermetrics-sidecar"
 SIDECAR_PLIST="/Library/LaunchDaemons/$SIDECAR_LABEL.plist"
 OLD_SIDECAR_LABEL="com.llama-cm.powermetrics-sidecar"
 
+# The unprivileged ramp agent (Sources/SMCRampAgent, product smcfan-rampd) -
+# the only piece that understands sensor curves any more; smcfand itself is
+# SMC-writer only. A LaunchAgent, not a LaunchDaemon: it needs no root.
+RAMPD_LABEL="com.smcfan.smcfan-rampd"
+RAMPD_PLIST="$HOME/Library/LaunchAgents/$RAMPD_LABEL.plist"
+RAMPD_DEST="$HOME/Library/Application Support/smcfan/rampd"
+
 SRC_CONF="${THERMAL_CONF:-$HOME/.config/smcfan/thermal.conf}"
 DEST_CONF="$DEST/thermal.conf"
 
@@ -101,12 +108,16 @@ case "${1:-}" in
   --uninstall)
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     rm -f "$PLIST"
-    echo "uninstalled $LABEL (the running daemon, if any, is left alone)"
+    launchctl bootout "gui/$(id -u)/$RAMPD_LABEL" 2>/dev/null || true
+    rm -f "$RAMPD_PLIST"
+    echo "uninstalled $LABEL and $RAMPD_LABEL (the running daemon, if any, is left alone)"
     exit 0
     ;;
   --status)
     launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
       | grep -E "state =|last exit|pid =" || echo "$LABEL: not loaded"
+    launchctl print "gui/$(id -u)/$RAMPD_LABEL" 2>/dev/null \
+      | grep -E "state =|last exit|pid =" || echo "$RAMPD_LABEL: not loaded"
     exit 0
     ;;
   "")
@@ -144,6 +155,22 @@ if [[ -r "$SMCFAN_SRC/Scripts/smcfan-ctl" && -x "$SMCFAN_SRC/.build/out/Products
 else
   echo "$SMCFAN_SRC has no built smcread/smcfan-ctl - build it first (swift build -c release)" >&2
   exit 1
+fi
+
+# smcfan-rampd: soft-fail (warn, keep installing) rather than the hard fail
+# above - a controller install must still succeed for someone who has not
+# built this yet; without it, a `ramp` request just sits unfulfilled.
+RAMPD_BIN_SRC="$SMCFAN_SRC/.build/out/Products/Release/smcfan-rampd"
+if [[ -x "$RAMPD_BIN_SRC" ]]; then
+  mkdir -p "$RAMPD_DEST"
+  cp "$RAMPD_BIN_SRC" "$RAMPD_DEST/smcfan-rampd"
+  sed -e "s|__RAMPD_BIN__|$RAMPD_DEST/smcfan-rampd|" \
+      -e "s|__LOGDIR__|$LOGDIR|" \
+      "$SRC_DIR/$RAMPD_LABEL.plist" > "$RAMPD_PLIST"
+  _bootstrap_agent "gui/$(id -u)" "$RAMPD_LABEL" "$RAMPD_PLIST" || exit 1
+  echo "installed $RAMPD_LABEL -> $RAMPD_DEST/smcfan-rampd"
+else
+  echo "$SMCFAN_SRC has no built smcfan-rampd - build it first (swift build -c release --product smcfan-rampd); skipping ramp-agent install (ramp requests will sit unfulfilled until it is installed)" >&2
 fi
 
 # Copy the config (if any) and every hook script it names, each with its

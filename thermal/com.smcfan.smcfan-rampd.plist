@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The unprivileged ramp agent (Sources/SMCRampAgent, product smcfan-rampd).
+  Install with:
+    bash install-thermal-agent.sh
+
+  This is the ONLY piece that understands sensor curves any more - the root
+  daemon smcfand is SMC-writer only (auto/constant/full). Without this agent
+  running, a `smcfan-ctl ramp ...` request just sits in ramp.json unfulfilled
+  and smcfand stays in whatever it last had (usually auto).
+
+  PROGRAM PATH IS A COPY, NOT THE REPO, same reason as the controller: macOS
+  TCC denies a launchd job any read under ~/Documents. Re-run the installer
+  after rebuilding this binary.
+
+  LaunchAgent, not LaunchDaemon: unlike smcfand it needs no root at all - it
+  only reads the SMC (same unprivileged path as `smcread`) and writes
+  /tmp/smcfan/desired.json, which is world-writable by smcfand's own design.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.smcfan.smcfan-rampd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__RAMPD_BIN__</string>
+  </array>
+
+  <!-- Always on: unlike the controller loop this has no manual stop
+       procedure of its own, and it is otherwise idle (auto, one write) the
+       moment no ramp is requested - so KeepAlive costs nothing and a crash
+       mid-ramp is exactly when it matters most to come back on its own. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__LOGDIR__/smcfan-rampd-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOGDIR__/smcfan-rampd-agent.log</string>
+</dict>
+</plist>

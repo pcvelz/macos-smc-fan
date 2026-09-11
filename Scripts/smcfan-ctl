@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 #
-# smcfan-ctl - writes /tmp/smcfan/desired.json for smcfand to pick up on
-# its next 2s poll, and refreshes the heartbeat. Does NOT touch the SMC
-# itself; it only talks to smcfand through the control file. Requires no
-# privilege (smcfand, running as root, owns all actual SMC writes).
+# smcfan-ctl - the only supported way to talk to the smcfan backend. Writes
+# TWO control files, never touches the SMC itself:
+#
+#   /tmp/smcfan/desired.json - read by smcfand (root daemon, the only SMC
+#     writer): auto|constant|full only. `constant`/`full` set this directly.
+#   /tmp/smcfan/ramp.json    - read by smcfan-rampd (unprivileged agent):
+#     the sensor/curve REQUEST. `ramp` sets this; smcfan-rampd is what turns
+#     it into `constant` writes on desired.json.
+#
+# `ramp` is a request to the AGENT, not to the daemon - smcfand itself has no
+# ramp/sensor logic at all. `auto` clears both, since either backend could be
+# the one currently holding the fans.
 #
 # Usage:
 #   smcfan-ctl auto
@@ -11,16 +19,17 @@
 #   smcfan-ctl constant <rpm>
 #   smcfan-ctl full
 #   smcfan-ctl status
-#   smcfan-ctl heartbeat   # re-touch the heartbeat on the current desired.json
-#                          # without changing mode; run this from cron/a loop
-#                          # at an interval well under 60s to keep a ramp or
-#                          # constant policy alive - smcfand fails safe to
-#                          # auto once the heartbeat goes stale.
+#   smcfan-ctl heartbeat   # re-touch the heartbeat on the current ramp.json
+#                          # request without changing it; run this from
+#                          # cron/a loop at an interval well under 60s to
+#                          # keep a ramp request alive - smcfan-rampd falls
+#                          # back to auto once the heartbeat goes stale.
 #
 set -euo pipefail
 
 CONTROL_DIR="/tmp/smcfan"
 DESIRED_FILE="${CONTROL_DIR}/desired.json"
+RAMP_FILE="${CONTROL_DIR}/ramp.json"
 SMCREAD_BIN="${SMCREAD_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.build/out/Products/Release/smcread}"
 
 mkdir -p "$CONTROL_DIR"
@@ -36,6 +45,12 @@ write_desired() {
   mv "${DESIRED_FILE}.tmp" "$DESIRED_FILE"
 }
 
+write_ramp() {
+  local json="$1"
+  printf '%s\n' "$json" > "${RAMP_FILE}.tmp"
+  mv "${RAMP_FILE}.tmp" "$RAMP_FILE"
+}
+
 usage() {
   echo "Usage: smcfan-ctl auto|ramp <sensor> <min_c> <max_c>|constant <rpm>|full|status" >&2
   exit 2
@@ -44,7 +59,10 @@ usage() {
 cmd="${1:-}"
 case "$cmd" in
   auto)
+    # Either backend (smcfand directly, or smcfan-rampd on its behalf) could
+    # currently be holding the fans, so clear both control files.
     write_desired "{\"mode\":\"auto\",\"heartbeat\":$(heartbeat_now)}"
+    write_ramp "{\"mode\":\"auto\"}"
     echo "smcfan-ctl: requested auto"
     ;;
 
@@ -57,7 +75,10 @@ case "$cmd" in
       echo "Usage: smcfan-ctl ramp <sensor> <min_c> <max_c> [smooth_s]" >&2
       exit 2
     fi
-    write_desired "{\"mode\":\"ramp\",\"sensor\":\"${sensor}\",\"minC\":${min_c},\"maxC\":${max_c},\"smoothS\":${smooth_s},\"heartbeat\":$(heartbeat_now)}"
+    # A REQUEST to smcfan-rampd, not to smcfand - the daemon has no ramp
+    # logic at all. The agent turns this into `constant` writes on
+    # desired.json once it is running and has a plausible reading.
+    write_ramp "{\"mode\":\"ramp\",\"sensor\":\"${sensor}\",\"minC\":${min_c},\"maxC\":${max_c},\"smoothS\":${smooth_s},\"heartbeat\":$(heartbeat_now)}"
     echo "smcfan-ctl: requested ramp sensor=${sensor} ${min_c}C-${max_c}C smooth_s=${smooth_s}"
     ;;
 
@@ -77,21 +98,32 @@ case "$cmd" in
     ;;
 
   heartbeat)
-    if [[ ! -f "$DESIRED_FILE" ]]; then
-      echo "smcfan-ctl: no desired.json to refresh; run auto/ramp/constant/full first" >&2
+    # Refreshes ramp.json only - a `ramp` request is the only policy with an
+    # unattended runner (thermal/controller.sh) that needs to keep it alive
+    # sub-60s; `constant`/`full` are set directly on desired.json and have no
+    # equivalent refresh path here.
+    if [[ ! -f "$RAMP_FILE" ]]; then
+      echo "smcfan-ctl: no ramp.json to refresh; run 'smcfan-ctl ramp ...' first" >&2
       exit 1
     fi
-    updated=$(sed -E "s/\"heartbeat\":[0-9.]+/\"heartbeat\":$(heartbeat_now)/" "$DESIRED_FILE")
-    write_desired "$updated"
+    updated=$(sed -E "s/\"heartbeat\":[0-9.]+/\"heartbeat\":$(heartbeat_now)/" "$RAMP_FILE")
+    write_ramp "$updated"
     ;;
 
   status)
-    echo "--- desired.json ---"
+    echo "--- desired.json (smcfand) ---"
     if [[ -f "$DESIRED_FILE" ]]; then
       cat "$DESIRED_FILE"
       echo
     else
       echo "(no desired.json - smcfand is running in fail-safe auto)"
+    fi
+    echo "--- ramp.json (smcfan-rampd) ---"
+    if [[ -f "$RAMP_FILE" ]]; then
+      cat "$RAMP_FILE"
+      echo
+    else
+      echo "(no ramp.json - no ramp request outstanding)"
     fi
     echo "--- smcread fans ---"
     if [[ -x "$SMCREAD_BIN" ]]; then
