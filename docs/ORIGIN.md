@@ -3,10 +3,10 @@
 Cloned from https://github.com/agoodkind/macos-smc-fan at commit
 `31a1feae0c4999ebd8cdddfbd90d2c98182091b8` on 2026-09-05.
 
-Purpose: local-only, scriptable, fail-safe fan control for llama-cm's
-thermal controller on this machine (Mac16,7). Never pushed
-anywhere; the `upstream` remote is fetch-only reference, there is no
-`origin`.
+Purpose: scriptable, fail-safe fan control for llama-cm's thermal
+controller, built and verified on a Mac16,7 (M4 Pro). Published as the
+public fork https://github.com/pcvelz/macos-smc-fan (branch `llama-cm`,
+remote `origin`); `upstream` stays a fetch-only reference.
 
 ## Architecture (llama-cm fork, branch `llama-cm`)
 
