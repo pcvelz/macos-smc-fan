@@ -72,14 +72,20 @@ struct DesiredState: Codable {
   var maxC: Double?
   var rpm: Double?
   var heartbeat: Double?
+  var smoothS: Double?
 }
 
 enum ResolvedMode {
   case auto
-  case ramp(sensor: String, minC: Double, maxC: Double)
+  case ramp(sensor: String, minC: Double, maxC: Double, smoothS: Double)
   case constant(rpm: Double)
   case full
 }
+
+/// Default EMA time constant (seconds) when desired.json omits `smoothS`.
+/// Matches Scripts/smcfan-ctl's default so a ctl caller that leaves the arg
+/// off gets the same smoothing the daemon assumes.
+private let defaultSmoothS: Double = 20
 
 func resolveDesiredMode() -> ResolvedMode {
   guard let data = FileManager.default.contents(atPath: desiredStatePath) else {
@@ -109,7 +115,7 @@ func resolveDesiredMode() -> ResolvedMode {
       logLine("ramp mode missing sensor/minC/maxC -> auto (fail-safe)")
       return .auto
     }
-    return .ramp(sensor: sensor, minC: minC, maxC: maxC)
+    return .ramp(sensor: sensor, minC: minC, maxC: maxC, smoothS: state.smoothS ?? defaultSmoothS)
   case "constant":
     guard let rpm = state.rpm else {
       logLine("constant mode missing rpm -> auto (fail-safe)")
@@ -228,6 +234,15 @@ final class DaemonFanWriter {
   }
 }
 
+// MARK: - Ramp temperature smoothing
+
+// Rebuilt whenever the ramp's sensor or requested tau changes, or the
+// daemon leaves/re-enters ramp mode - carrying a stale EMA across a
+// mode/sensor switch would blend readings from an unrelated stream.
+private var rampSmoother = TemperatureSmoother(tau: defaultSmoothS)
+private var lastRampSensor: String?
+private var lastRampSmoothS: Double?
+
 // MARK: - Signal handling (fail-safe on termination)
 
 private var shouldExit = false
@@ -253,6 +268,20 @@ while !shouldExit {
   let mode = resolveDesiredMode()
   let fanCount = writer.fanCount()
 
+  if case let .ramp(sensorName, _, _, smoothS) = mode {
+    // Reset the smoother across a sensor or tau change, or on re-entering
+    // ramp after any other mode - never blend across an unrelated stream.
+    if lastRampSensor != sensorName || lastRampSmoothS != smoothS {
+      rampSmoother = TemperatureSmoother(tau: smoothS)
+      lastRampSensor = sensorName
+      lastRampSmoothS = smoothS
+    }
+  } else if lastRampSensor != nil {
+    rampSmoother.reset()
+    lastRampSensor = nil
+    lastRampSmoothS = nil
+  }
+
   switch mode {
   case .auto:
     for fan in 0..<fanCount where writer.isManual(fan: fan) {
@@ -260,14 +289,15 @@ while !shouldExit {
       logLine("fan\(fan): set to auto")
     }
 
-  case let .ramp(sensorName, minC, maxC):
-    guard let temperature = writer.averageTemperature(sensorName: sensorName) else {
+  case let .ramp(sensorName, minC, maxC, _):
+    guard let rawTemperature = writer.averageTemperature(sensorName: sensorName) else {
       logLine("ramp: sensor '\(sensorName)' unavailable -> auto (fail-safe)")
       for fan in 0..<fanCount where writer.isManual(fan: fan) {
         writer.setFanAuto(fan: fan)
       }
       break
     }
+    let temperature = rampSmoother.update(rawTemperature) ?? rawTemperature
     for fan in 0..<fanCount {
       let minRPM = writer.readFloat(SMCFanKey.minimum, fan: fan)
       let maxRPM = writer.readFloat(SMCFanKey.maximum, fan: fan)
@@ -276,7 +306,9 @@ while !shouldExit {
         maxRPM: maxRPM)
       writer.setFanRPM(fan: fan, rpm: target)
     }
-    logLine("ramp: \(sensorName)=\(String(format: "%.1f", temperature))C applied to \(fanCount) fans")
+    logLine(
+      "ramp: \(sensorName) raw=\(String(format: "%.1f", rawTemperature))C "
+        + "smoothed=\(String(format: "%.1f", temperature))C applied to \(fanCount) fans")
 
   case let .constant(rpm):
     for fan in 0..<fanCount {

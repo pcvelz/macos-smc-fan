@@ -64,7 +64,7 @@ _load_config() {
         case "$key" in
             GPU_UTIL_PCT|CPU_LOAD_MW|POLL_INTERVAL|ON_SUSTAIN_SECONDS|OFF_SUSTAIN_SECONDS|\
             ALERT_AFTER_SECONDS|ALERT_CLEAR_SECONDS|\
-            SMCFAN_SENSOR|SMCFAN_MIN_C|SMCFAN_MAX_C|SMCFAN_CTL|\
+            SMCFAN_SENSOR|SMCFAN_MIN_C|SMCFAN_MAX_C|SMCFAN_SMOOTH_S|SMCFAN_CTL|\
             PRESSURE_LOG|EXTERNAL_ON_CMD|EXTERNAL_OFF_CMD|EXTERNAL_STATUS_CMD|ALERT_CMD)
                 if [[ -z "${!key:-}" ]]; then
                     printf -v "$key" '%s' "$val"
@@ -95,6 +95,7 @@ SMCFAN_LIVENESS_SECONDS="${SMCFAN_LIVENESS_SECONDS:-30}"  # > several 2s polls, 
 SMCFAN_SENSOR="${SMCFAN_SENSOR:-cpu_core_average}"        # sensor the ramp targets
 SMCFAN_MIN_C="${SMCFAN_MIN_C:-45}"
 SMCFAN_MAX_C="${SMCFAN_MAX_C:-75}"
+SMCFAN_SMOOTH_S="${SMCFAN_SMOOTH_S:-20}"                   # EMA time constant (s); smcfand default matches, 0 = off
 
 # --- optional external fan --------------------------------------------------
 # Any shell command; run with `bash -c`, no arguments passed. Leave both
@@ -337,8 +338,8 @@ set_internal_fan_smcfan() {
         return 0
     fi
     case "$want" in
-        ramp)  log "ACTUATE internal fan -> ramp (smcfan-ctl ramp $SMCFAN_SENSOR $SMCFAN_MIN_C $SMCFAN_MAX_C)"
-               out=$(bash "$SMCFAN_CTL" ramp "$SMCFAN_SENSOR" "$SMCFAN_MIN_C" "$SMCFAN_MAX_C" 2>&1) ;;
+        ramp)  log "ACTUATE internal fan -> ramp (smcfan-ctl ramp $SMCFAN_SENSOR $SMCFAN_MIN_C $SMCFAN_MAX_C $SMCFAN_SMOOTH_S)"
+               out=$(bash "$SMCFAN_CTL" ramp "$SMCFAN_SENSOR" "$SMCFAN_MIN_C" "$SMCFAN_MAX_C" "$SMCFAN_SMOOTH_S" 2>&1) ;;
         stock) log "ACTUATE internal fan -> stock (smcfan-ctl auto)"
                out=$(bash "$SMCFAN_CTL" auto 2>&1) ;;
     esac

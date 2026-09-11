@@ -338,10 +338,21 @@ setup_smcfan() {
 dir=$(setup_scenario "$GPU_IDLE_PCT" "$BUSY_MW"); setup_smcfan "$dir"
 seed_state "$dir" 0 1
 out=$(run_tick_smcfan "$dir")
-if grep -q "smcfan-ctl ramp cpu_core_average 45 75" <<<"$out"; then
-    PASS "L: smcfan backend engages the ramp via smcfan-ctl (45-75C on cpu_core_average)"
+if grep -q "smcfan-ctl ramp cpu_core_average 45 75 20" <<<"$out"; then
+    PASS "L: smcfan backend engages the ramp via smcfan-ctl (45-75C on cpu_core_average, smooth_s=20 default)"
 else
-    FAIL "L: smcfan backend did not actuate through smcfan-ctl"
+    FAIL "L: smcfan backend did not actuate through smcfan-ctl with the smooth_s arg"
+    echo "--- tick output ---"; echo "$out"; echo "-------------------"
+fi
+
+# ---- Case L2: SMCFAN_SMOOTH_S is honoured as a config/env override --------
+dir=$(setup_scenario "$GPU_IDLE_PCT" "$BUSY_MW"); setup_smcfan "$dir"
+seed_state "$dir" 0 1
+out=$(SMCFAN_SMOOTH_S=45 run_tick_smcfan "$dir")
+if grep -q "smcfan-ctl ramp cpu_core_average 45 75 45" <<<"$out"; then
+    PASS "L2: SMCFAN_SMOOTH_S override is passed through to smcfan-ctl"
+else
+    FAIL "L2: SMCFAN_SMOOTH_S override was not passed through"
     echo "--- tick output ---"; echo "$out"; echo "-------------------"
 fi
 
@@ -718,10 +729,36 @@ mkdir -p "$fake_home/Library/LaunchAgents"
 
 fake_bin="$install_dir/bin"
 mkdir -p "$fake_bin"
+# Simulates just enough launchd state for _bootstrap_agent's
+# bootout -> poll print -> bootstrap sequence to resolve immediately: bootout
+# clears a per-label "loaded" marker, print succeeds only while the marker
+# exists, bootstrap recreates it. Keeps case e fast (no real 10s wait) while
+# still exercising the real bootout/print/bootstrap call sequence.
 cat > "$fake_bin/launchctl" <<'STUB'
 #!/usr/bin/env bash
 echo "launchctl $*" >> "$FAKE_BIN_LOG"
-exit 0
+mkdir -p "$FAKE_BIN_STATE"
+case "${1:-}" in
+    bootout)
+        label="${2##*/}"
+        rm -f "$FAKE_BIN_STATE/$label.loaded"
+        exit 0
+        ;;
+    bootstrap)
+        label="$(basename "${3:-}" .plist)"
+        touch "$FAKE_BIN_STATE/$label.loaded"
+        exit 0
+        ;;
+    print)
+        label="${2##*/}"
+        [[ -f "$FAKE_BIN_STATE/$label.loaded" ]] || { echo "Could not find service \"$label\""; exit 1; }
+        echo "state = running"
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
 STUB
 chmod +x "$fake_bin/launchctl"
 cat > "$fake_bin/sudo" <<'STUB'
@@ -747,6 +784,7 @@ installer_out=$(env -i \
     HOME="$fake_home" \
     PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     FAKE_BIN_LOG="$install_dir/fake-bin.log" \
+    FAKE_BIN_STATE="$install_dir/fake-bin-state" \
     THERMAL_CONF="$fake_conf" \
     SMCFAN_SRC="$fake_smcfan_src" \
         bash "$REPO/install-thermal-agent.sh" 2>&1)

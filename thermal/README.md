@@ -26,7 +26,11 @@ actuators off two signals:
   Driven by GPU utilisation OR CPU power - either signal engages it, both must
   cool to release it. Internal actuation is **best-effort**: a missing or
   wedged `smcfan-ctl` logs and returns 0, degrading to external-fan-only (if
-  configured) rather than killing the loop.
+  configured) rather than killing the loop. The ramp's temperature input is
+  smoothed by `smcfand` with an exponential moving average (`SMCFAN_SMOOTH_S`,
+  default 20s) before it hits the curve - `cpu_core_average` jumps >=5C on
+  power-gated-core noise in a large fraction of 2s polls, and unsmoothed that
+  swings the fan target ~1500 RPM every poll; `0` disables smoothing.
 - **An optional external fan**, driven by whatever command you configure
   (`EXTERNAL_ON_CMD` / `EXTERNAL_OFF_CMD` / `EXTERNAL_STATUS_CMD` in
   `thermal.conf` - see `thermal.conf.example`). Driven by GPU utilisation

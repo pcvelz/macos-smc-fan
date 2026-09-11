@@ -31,6 +31,9 @@ ALERT_CLEAR_SECONDS=120      # GPU back above threshold this long before the ale
 SMCFAN_SENSOR=cpu_core_average   # sensor smcfand ramps against
 SMCFAN_MIN_C=45                  # curve floor: min RPM below this temperature
 SMCFAN_MAX_C=75                  # curve ceiling: max RPM at/above this temperature
+SMCFAN_SMOOTH_S=20               # EMA time constant (s) smoothing the ramp's temperature input;
+                                  # cuts the power-gated-core noise that otherwise swings the fan
+                                  # target ~1500 RPM every 2s poll. 0 disables smoothing.
 # SMCFAN_CTL=/path/to/smcfan-ctl # override; defaults to ../Scripts/smcfan-ctl next to controller.sh
 
 # --- powermetrics sidecar log ------------------------------------------

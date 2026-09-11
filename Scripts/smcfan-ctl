@@ -7,7 +7,7 @@
 #
 # Usage:
 #   smcfan-ctl auto
-#   smcfan-ctl ramp <sensor: cpu_core_average|gpu_cluster_average> <min_c> <max_c>
+#   smcfan-ctl ramp <sensor: cpu_core_average|gpu_cluster_average> <min_c> <max_c> [smooth_s]
 #   smcfan-ctl constant <rpm>
 #   smcfan-ctl full
 #   smcfan-ctl status
@@ -52,12 +52,13 @@ case "$cmd" in
     sensor="${2:-}"
     min_c="${3:-}"
     max_c="${4:-}"
+    smooth_s="${5:-20}"
     if [[ -z "$sensor" || -z "$min_c" || -z "$max_c" ]]; then
-      echo "Usage: smcfan-ctl ramp <sensor> <min_c> <max_c>" >&2
+      echo "Usage: smcfan-ctl ramp <sensor> <min_c> <max_c> [smooth_s]" >&2
       exit 2
     fi
-    write_desired "{\"mode\":\"ramp\",\"sensor\":\"${sensor}\",\"minC\":${min_c},\"maxC\":${max_c},\"heartbeat\":$(heartbeat_now)}"
-    echo "smcfan-ctl: requested ramp sensor=${sensor} ${min_c}C-${max_c}C"
+    write_desired "{\"mode\":\"ramp\",\"sensor\":\"${sensor}\",\"minC\":${min_c},\"maxC\":${max_c},\"smoothS\":${smooth_s},\"heartbeat\":$(heartbeat_now)}"
+    echo "smcfan-ctl: requested ramp sensor=${sensor} ${min_c}C-${max_c}C smooth_s=${smooth_s}"
     ;;
 
   constant)

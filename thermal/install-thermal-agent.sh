@@ -37,6 +37,45 @@ OLD_SIDECAR_LABEL="com.llama-cm.powermetrics-sidecar"
 SRC_CONF="${THERMAL_CONF:-$HOME/.config/smcfan/thermal.conf}"
 DEST_CONF="$DEST/thermal.conf"
 
+# `launchctl bootout` returns as soon as launchd has QUEUED the unload, not
+# once the service is actually gone from the domain, so a `bootstrap` fired
+# immediately after can race launchd and fail with "Bootstrap failed: 5:
+# Input/output error", leaving the agent not running with nothing left to
+# retry it. So: bootout, then poll `launchctl print` (bounded, up to 10s)
+# until the label is gone before bootstrapping; if bootstrap itself still
+# fails, wait 2s and retry once; if the agent is not running after all that,
+# fail loudly rather than leave a silently-dead install. $4 = "sudo" for the
+# privileged system-domain sidecar.
+#   $1 domain (e.g. "gui/501" or "system")  $2 label  $3 plist path
+_bootstrap_agent() {
+    local domain="$1" label="$2" plist="$3" use_sudo="${4:-}" deadline
+    local lctl=(launchctl)
+    [[ "$use_sudo" == "sudo" ]] && lctl=(sudo launchctl)
+
+    "${lctl[@]}" bootout "$domain/$label" 2>/dev/null || true
+
+    deadline=$(( $(date +%s) + 10 ))
+    while "${lctl[@]}" print "$domain/$label" >/dev/null 2>&1; do
+        (( $(date +%s) >= deadline )) && break
+        sleep 0.5
+    done
+
+    if ! "${lctl[@]}" bootstrap "$domain" "$plist"; then
+        echo "install-thermal-agent: bootstrap failed for $label, retrying once after 2s..." >&2
+        sleep 2
+        if ! "${lctl[@]}" bootstrap "$domain" "$plist"; then
+            echo "FATAL: launchctl bootstrap failed twice for $label" >&2
+            return 1
+        fi
+    fi
+
+    if ! "${lctl[@]}" print "$domain/$label" >/dev/null 2>&1; then
+        echo "FATAL: $label is not running after bootstrap" >&2
+        return 1
+    fi
+    return 0
+}
+
 case "${1:-}" in
   --install-sidecar)
     # Separate subcommand because this is the ONE privileged step: powermetrics
@@ -49,8 +88,7 @@ case "${1:-}" in
     # Both write the same log; two samplers would interleave it.
     sudo launchctl bootout "system/$OLD_SIDECAR_LABEL" 2>/dev/null || true
     sudo rm -f "/Library/LaunchDaemons/$OLD_SIDECAR_LABEL.plist"
-    sudo launchctl bootout "system/$SIDECAR_LABEL" 2>/dev/null || true
-    sudo launchctl bootstrap system "$SIDECAR_PLIST"
+    _bootstrap_agent system "$SIDECAR_LABEL" "$SIDECAR_PLIST" sudo || exit 1
     echo "installed $SIDECAR_LABEL -> /tmp/t1-powermetrics-smc.log"
     exit 0
     ;;
@@ -145,8 +183,7 @@ sed -e "s|__CONTROLLER__|$DEST/controller.sh|" \
     -e "s|__THERMAL_CONF__|$DEST_CONF|" \
     "$SRC_DIR/$LABEL.plist" > "$PLIST"
 
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+_bootstrap_agent "gui/$(id -u)" "$LABEL" "$PLIST" || exit 1
 
 echo "installed $LABEL -> $DEST/controller.sh"
 echo "agent log: $LOGDIR/thermal-controller-agent.log"
