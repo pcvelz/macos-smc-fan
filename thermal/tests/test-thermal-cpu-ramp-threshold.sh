@@ -25,6 +25,16 @@ FAIL() { echo "FAIL:  $*"; fail=$((fail + 1)); }
 
 [[ -r "$CONTROLLER" ]] || { echo "FATAL: controller.sh not readable at $CONTROLLER"; exit 1; }
 
+# Keep every case off the machine's real config and daemon state: an
+# installed ~/.config/smcfan/thermal.conf would otherwise fill any hook the
+# case leaves unset (real EXTERNAL_STATUS_CMD etc.), and the live
+# /tmp/smcfan/desired.json would decide the internal-fan state. Cases that
+# need either set their own value, which wins over these exports.
+_HERMETIC_DIR=$(mktemp -d)
+export THERMAL_CONF="$_HERMETIC_DIR/no-such-thermal.conf"
+export SMCFAN_DESIRED="$_HERMETIC_DIR/no-such-desired.json"
+export SMCFAN_LOG="$_HERMETIC_DIR/no-such-smcfand.log"
+
 # CPU load levels come from the measured distribution documented inline in
 # controller.sh. QUIET_MW is an idle-ish desktop that must never ramp.
 # BUSY_MW is real sustained CPU work that must ramp.
