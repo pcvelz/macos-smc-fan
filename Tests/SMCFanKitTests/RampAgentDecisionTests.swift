@@ -14,6 +14,19 @@ struct RampAgentDecisionTests {
   static let request = RampAgentDecision.Request(
     sensor: "cpu_core_average", minC: 45, maxC: 75, smoothS: 20, heartbeat: 1000)
 
+  @Test("deadband: a change smaller than the band keeps the previous target")
+  func deadbandHoldsSmallChanges() {
+    #expect(RampAgentDecision.applyDeadband(new: 4452, previous: 4377, band: 100) == 4377)
+    #expect(RampAgentDecision.applyDeadband(new: 4290, previous: 4377, band: 100) == 4377)
+  }
+
+  @Test("deadband: a change of at least the band, or no previous target, takes the new value")
+  func deadbandPassesRealChanges() {
+    #expect(RampAgentDecision.applyDeadband(new: 4477, previous: 4377, band: 100) == 4477)
+    #expect(RampAgentDecision.applyDeadband(new: 3000, previous: 4377, band: 100) == 3000)
+    #expect(RampAgentDecision.applyDeadband(new: 4452, previous: nil, band: 100) == 4452)
+  }
+
   @Test("no request at all -> auto")
   func noRequestIsAuto() {
     let desired = RampAgentDecision.decide(

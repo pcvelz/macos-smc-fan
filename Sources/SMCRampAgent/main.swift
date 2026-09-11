@@ -38,6 +38,8 @@ private let rampPath = controlDir + "/ramp.json"
 private let desiredPath = controlDir + "/desired.json"
 private let pollInterval: TimeInterval = 2.0
 private let staleAfter: TimeInterval = 60.0
+// Smallest target change worth a new fan write (see RampAgentDecision.applyDeadband).
+private let rpmDeadband: Float = 100
 
 // MARK: - ramp.json schema (written by Scripts/smcfan-ctl)
 
@@ -144,6 +146,7 @@ var lastSmoothS: Double?
 // request writes it exactly ONCE rather than fighting for desired.json every
 // poll against whatever else might be setting it by hand.
 var lastWasAuto = true
+var lastRPM: Float?
 
 while true {
   let request = readRampRequest()
@@ -177,10 +180,15 @@ while true {
 
   switch decision {
   case let .constant(rpm):
-    writeDesired(mode: "constant", rpm: rpm)
+    // Same target is re-sent every poll anyway: it carries the fresh
+    // heartbeat smcfand's dead-man switch needs.
+    let target = RampAgentDecision.applyDeadband(new: rpm, previous: lastRPM, band: rpmDeadband)
+    writeDesired(mode: "constant", rpm: target)
+    lastRPM = target
     lastWasAuto = false
 
   case .auto:
+    lastRPM = nil
     if !lastWasAuto {
       writeDesired(mode: "auto", rpm: nil)
       lastWasAuto = true

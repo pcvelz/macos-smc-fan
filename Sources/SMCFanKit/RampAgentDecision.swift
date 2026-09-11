@@ -77,4 +77,13 @@ public enum RampAgentDecision {
       maxRPM: maxRPM)
     return .constant(rpm: rpm)
   }
+
+  /// Keeps `previous` unless `new` differs from it by at least `band` RPM.
+  /// Even smoothed, the computed target drifts a few RPM every poll; without
+  /// a deadband every poll is a new SMC write and a new daemon log line for
+  /// a change nobody can hear.
+  public static func applyDeadband(new: Float, previous: Float?, band: Float) -> Float {
+    guard let previous else { return new }
+    return abs(new - previous) >= band ? new : previous
+  }
 }
