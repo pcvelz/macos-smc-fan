@@ -100,10 +100,17 @@ SMCFAN_MAX_C="${SMCFAN_MAX_C:-75}"
 # Any shell command; run with `bash -c`, no arguments passed. Leave both
 # EXTERNAL_ON_CMD and EXTERNAL_OFF_CMD unset to run internal-fans-only - the
 # whole external-fan section of every tick is then skipped, not merely
-# no-op'd. EXTERNAL_STATUS_CMD is optional even when the on/off commands are
-# set: without it OVERRIDE detection is skipped and the fan's state is taken
-# to be whatever we last commanded (never "unknown before we ever asked").
-# It must print exactly "on", "off", or "unknown".
+# no-op'd. EXTERNAL_STATUS_CMD is a manual-diagnostics hook ONLY (`controller.sh
+# probe` and `cmd_reset`'s "already off" check) - tick() never calls it. The
+# external fan is a real-world switch (e.g. a Home Assistant entity) and
+# polling it every tick would spam that backend for no reason, so the tick
+# decision is edge-triggered purely off the controller's OWN last-commanded
+# state (EXT_FAN_COMMANDED_F): it acts only when the desired state differs
+# from what it last asked for. A side effect worth calling out: a human who
+# flips the switch by hand between crossings is never overridden - the
+# controller has no way to see that flip without polling, and the rule that
+# forbids polling is more important than reasserting our own command. It must
+# print exactly "on", "off", or "unknown" when used via `probe`/`reset`.
 EXTERNAL_ON_CMD="${EXTERNAL_ON_CMD:-}"
 EXTERNAL_OFF_CMD="${EXTERNAL_OFF_CMD:-}"
 EXTERNAL_STATUS_CMD="${EXTERNAL_STATUS_CMD:-}"
@@ -389,7 +396,10 @@ smcfan_liveness_check() {
 # ALERT_AFTER_SECONDS - one notification per dip (see the latch in tick()).
 raise_alert() {
     local streak="$1" gpu="$2" fan
-    fan=$(_has_external_fan && read_external_fan_state || echo none)
+    # Last-commanded, not a live poll: raise_alert runs from inside tick(),
+    # and tick() never calls EXTERNAL_STATUS_CMD (see the external-fan
+    # section above) - an alert must not become a backdoor poll.
+    fan=$(_has_external_fan && _last_commanded_external_fan || echo none)
     log "COOL-DIP ALERT: GPU dropped below ${GPU_UTIL_PCT}% and stayed there ${streak}s (>= ${ALERT_AFTER_SECONDS}s), now at ${gpu}%"
     {
         echo "$(date '+%Y-%m-%d %H:%M:%S') COOL-DIP ALERT"
@@ -562,36 +572,29 @@ tick() {
     smcfan_heartbeat
 
     # ---- external fan: GPU only, and only when configured -------------------
+    # Edge-triggered on our OWN last-commanded state, never on a live poll:
+    # EXTERNAL_STATUS_CMD is never called here, on any tick, by design (see
+    # the CONFIG comment above) - a real switch (e.g. Home Assistant) must not
+    # be polled every tick just to decide whether to act. This also means a
+    # human's manual flip is never detected or fought between crossings: it
+    # sticks until the next real threshold crossing commands the opposite
+    # state, which is the whole point.
     if _has_external_fan; then
         want_fan=""
         (( g_hot_sust == 1 ))  && want_fan=on
         (( g_cool_sust == 1 )) && want_fan=off
 
         if [[ -n "$want_fan" ]]; then
-            fan=$(read_external_fan_state)
-            ext_snapshot="$fan"
+            fan=$(_last_commanded_external_fan)
             if [[ "$fan" == "$want_fan" ]]; then
-                log "  external fan already ${want_fan}"
-            elif [[ "$want_fan" == "on" && "$fan" == "off" ]]; then
-                # A fan reading off while GPU load wants it on is only an
-                # OVERRIDE (someone else flipped it) if WE last commanded it
-                # on - if we ourselves commanded off (a normal cool-down),
-                # this is just the fan turning back on for a new hot episode.
-                if [[ "$(_read_state "$EXT_FAN_COMMANDED_F")" == "on" ]]; then
-                    log "  OVERRIDE fan reads off while GPU loaded (${gpu}%) - re-asserting on (external actor turned it off)"
-                else
-                    log "  external fan off -> on"
-                fi
-                set_external_fan on
-                ext_snapshot=on
+                log "  external fan already ${want_fan} (commanded)"
             else
                 log "  external fan ${fan} -> ${want_fan}"
                 set_external_fan "$want_fan"
-                ext_snapshot="$want_fan"
             fi
+            ext_snapshot="$want_fan"
         else
-            # Nothing to change this tick - do not poll EXTERNAL_STATUS_CMD
-            # just to fill in the snapshot; the last-commanded value stands in.
+            # Nothing to change this tick - the last-commanded value stands in.
             ext_snapshot=$(_last_commanded_external_fan)
         fi
     fi

@@ -71,12 +71,16 @@ EOF
 
     # Stub external fan: one script, three subcommands, so EXTERNAL_ON_CMD /
     # EXTERNAL_OFF_CMD / EXTERNAL_STATUS_CMD can each point at "$dir/ext-fan.sh <verb>".
-    # "off" is the resting state the CPU-only cases must preserve.
-    cat > "$dir/ext-fan.sh" <<'STUB'
+    # "off" is the resting state the CPU-only cases must preserve. Every
+    # invocation (on/off/status alike) is also appended to ext-fan-calls.log
+    # so tests can assert on the NUMBER of calls, not just their content -
+    # that is what proves a tick did (or did not) poll/actuate at all.
+    cat > "$dir/ext-fan.sh" <<STUB
 #!/usr/bin/env bash
-case "${1:-}" in
+echo "\$*" >> "$dir/ext-fan-calls.log"
+case "\${1:-}" in
     status) echo "off" ;;
-    *)      echo "stub-ext-fan called with: $*" ;;
+    *)      echo "stub-ext-fan called with: \$*" ;;
 esac
 STUB
     chmod +x "$dir/ext-fan.sh"
@@ -123,6 +127,43 @@ run_tick() {
     EXTERNAL_STATUS_CMD="$dir/ext-fan.sh status" \
     ALERT_CMD="" \
         bash "$CONTROLLER" once 2>&1
+}
+
+# Same shape as run_tick, but DRY_RUN=0 so on/off actually invoke the stub
+# (DRY_RUN=1 logs the actuation but never calls the command) - needed by
+# cases that count real on/off calls, not just the tick's log text.
+# INTERNAL_FAN_ENABLED=0 keeps it from touching the real smcfan-ctl.
+run_tick_actuate() {
+    local dir="$1"
+    DRY_RUN=0 \
+    INTERNAL_FAN_ENABLED=0 \
+    PRESSURE_LOG="$dir/sidecar.log" \
+    GPU_UTIL_SRC="$dir/gpu-util.ioreg" \
+    STATE_DIR="$dir/state" \
+    LOG_FILE="$dir/controller.log" \
+    ALERT_FILE="$dir/cool-dip-alert" \
+    STATE_FILE="$dir/state.snapshot" \
+    EXTERNAL_ON_CMD="$dir/ext-fan.sh on" \
+    EXTERNAL_OFF_CMD="$dir/ext-fan.sh off" \
+    EXTERNAL_STATUS_CMD="$dir/ext-fan.sh status" \
+    ALERT_CMD="" \
+        bash "$CONTROLLER" once 2>&1
+}
+
+# A scenario's ext-fan.sh whose "status" answer is fixed by the caller - it
+# stands in for a human who manually flipped the switch - while still logging
+# every invocation, same as the default stub.
+setup_manual_stub() {
+    local dir="$1" manual_status="$2"
+    cat > "$dir/ext-fan.sh" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$dir/ext-fan-calls.log"
+case "\${1:-}" in
+    status) echo "$manual_status" ;;
+    *)      : ;;
+esac
+STUB
+    chmod +x "$dir/ext-fan.sh"
 }
 
 echo "== thermal controller: CPU-hot reach =="
@@ -229,20 +270,30 @@ else
     echo "--- tick output ---"; echo "$out"; echo "-------------------"
 fi
 
-# ---- Case J: OVERRIDE only fires when WE last commanded the fan on --------
+# ---- Case J: commanded already "on" while GPU stays hot sustained is read
+# straight from the commanded state, no poll -------------------------------
+# Was: "OVERRIDE only fires when WE last commanded the fan on" - OVERRIDE
+# detection required polling EXTERNAL_STATUS_CMD on every sustained tick to
+# catch a human's manual flip, which is exactly the "never poll between
+# crossings" rule this file's cases a/b/c/d now pin. OVERRIDE (and its poll)
+# is gone; this case now pins the replacement behaviour: a commanded state
+# that already matches the tick's decision is recognised from the state file
+# alone, with zero calls to the external-fan command.
 dir=$(setup_scenario "$GPU_BUSY_PCT" "$QUIET_MW")
 seed_state "$dir" 1 0
 echo on > "$dir/state/external_fan_commanded"
 out=$(run_tick "$dir")
-if grep -q "OVERRIDE fan reads off while GPU loaded" <<<"$out"; then
-    PASS "J: a commanded-on fan reading off is reported as OVERRIDE"
+calls=$([[ -f "$dir/ext-fan-calls.log" ]] && wc -l < "$dir/ext-fan-calls.log" || echo 0)
+if grep -q "external fan already on" <<<"$out" && ! grep -q "OVERRIDE" <<<"$out" && [[ "$calls" -eq 0 ]]; then
+    PASS "J: commanded-on fan with GPU still hot logs 'already on' with zero calls, no OVERRIDE"
 else
-    FAIL "J: commanded-on fan reading off was not reported as OVERRIDE"
+    FAIL "J: commanded-on fan with GPU still hot was not recognized without polling (calls=$calls)"
     echo "--- tick output ---"; echo "$out"; echo "-------------------"
 fi
 
-# ---- Case K: controller-initiated off, then re-hot, is a normal transition,
-# NOT an OVERRIDE -------------------------------------------------------------
+# ---- Case K: commanded off, then GPU goes hot sustained, is a normal
+# transition, NOT an OVERRIDE (OVERRIDE itself is gone - see Case J - but the
+# "off -> on on a real crossing" behaviour it used to gate must still work) --
 dir=$(setup_scenario "$GPU_BUSY_PCT" "$QUIET_MW")
 seed_state "$dir" 1 0
 echo off > "$dir/state/external_fan_commanded"
@@ -410,8 +461,11 @@ else
     echo "--- tick output ---"; echo "$out"; echo "-------------------"
 fi
 
-# ---- Case T: EXTERNAL_STATUS_CMD absent -> no OVERRIDE possible, state falls
-# back to the last commanded value ------------------------------------------
+# ---- Case T: EXTERNAL_STATUS_CMD absent -> state falls back to the last
+# commanded value, same as when it IS configured (tick() never polls it at
+# all any more - see cases a/b/c/d - so its presence or absence no longer
+# changes tick behaviour; this case now just pins that the fallback path
+# still works with the command entirely unset) ------------------------------
 dir=$(setup_scenario "$GPU_BUSY_PCT" "$QUIET_MW")
 seed_state "$dir" 1 0
 echo on > "$dir/state/external_fan_commanded"
@@ -479,10 +533,11 @@ fi
 
 # ---- Case W: a tick that does not touch the external-fan section (nothing
 # sustained yet) must poll EXTERNAL_STATUS_CMD zero times — the snapshot
-# reuses the tick's already-polled value or the last-commanded fallback, it
-# never triggers its own extra poll. First tick + idle GPU: hysteresis starts
-# empty, so neither g_hot_sust nor g_cool_sust is set and the whole
-# external-fan block is skipped.
+# reuses the last-commanded fallback, it never triggers its own extra poll.
+# First tick + idle GPU: hysteresis starts empty, so neither g_hot_sust nor
+# g_cool_sust is set and the whole external-fan block is skipped. (tick() now
+# never calls EXTERNAL_STATUS_CMD at all, even when the block IS entered -
+# see cases a/b/c/d - so this is one instance of a now-general rule.)
 dir=$(setup_scenario "$GPU_IDLE_PCT" "$QUIET_MW")
 mkdir -p "$dir/state"
 cat > "$dir/status-count.sh" <<EOSTUB
@@ -508,6 +563,201 @@ if [[ ! -f "$dir/status-calls" ]]; then
 else
     FAIL "W: EXTERNAL_STATUS_CMD was polled $(wc -l < "$dir/status-calls") time(s) on a tick with no fan action due"
     echo "--- tick output ---"; echo "$out"; echo "-------------------"
+fi
+
+echo
+echo "== thermal controller: external fan is edge-triggered, never polled between crossings =="
+echo
+
+# ---- Case a: GPU cool and sustained, we last commanded off, a human has
+# manually switched the external fan ON (the status stub reports "on"). The
+# controller must make ZERO calls of any kind across several ticks - no
+# status poll, no off command - because no threshold crossing happened; the
+# manual "on" must stick.
+dir=$(setup_scenario "$GPU_IDLE_PCT" "$QUIET_MW")
+setup_manual_stub "$dir" "on"
+seed_state "$dir" 0 0
+echo off > "$dir/state/external_fan_commanded"
+run_tick "$dir" >/dev/null
+run_tick "$dir" >/dev/null
+run_tick "$dir" >/dev/null
+calls=$([[ -f "$dir/ext-fan-calls.log" ]] && wc -l < "$dir/ext-fan-calls.log" || echo 0)
+if [[ "$calls" -eq 0 ]]; then
+    PASS "a: manual fan-on during a sustained-cool episode stays on (zero calls over 3 ticks)"
+else
+    FAIL "a: manual fan-on during a sustained-cool episode was touched ($calls call(s))"
+    echo "--- calls ---"; cat "$dir/ext-fan-calls.log" 2>/dev/null; echo "-------------"
+fi
+
+# ---- Case b: GPU hot and sustained, we last commanded on, a human has
+# manually switched the external fan OFF during the hot episode (the status
+# stub reports "off"). The controller must make ZERO calls across several
+# ticks - no status poll, no re-assertion of on - because no threshold
+# crossing happened; the manual "off" must stick.
+dir=$(setup_scenario "$GPU_BUSY_PCT" "$QUIET_MW")
+setup_manual_stub "$dir" "off"
+seed_state "$dir" 1 0
+echo on > "$dir/state/external_fan_commanded"
+run_tick "$dir" >/dev/null
+run_tick "$dir" >/dev/null
+run_tick "$dir" >/dev/null
+calls=$([[ -f "$dir/ext-fan-calls.log" ]] && wc -l < "$dir/ext-fan-calls.log" || echo 0)
+if [[ "$calls" -eq 0 ]]; then
+    PASS "b: manual fan-off during a sustained-hot episode stays off (zero calls over 3 ticks)"
+else
+    FAIL "b: manual fan-off during a sustained-hot episode was touched ($calls call(s))"
+    echo "--- calls ---"; cat "$dir/ext-fan-calls.log" 2>/dev/null; echo "-------------"
+fi
+
+# ---- Case c: a cool -> hot -> cool sequence fires "on" exactly once at the
+# crossing into hot, zero calls on every steady-hot tick that follows, and
+# "off" exactly once at the crossing back to cool - and never a status poll.
+# Each step hand-seeds the hysteresis files the way seed_state does, so the
+# sequence does not depend on real wall-clock time between ticks.
+dir=$(setup_scenario "$GPU_IDLE_PCT" "$QUIET_MW")
+cat > "$dir/ext-fan.sh" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$dir/ext-fan-calls.log"
+case "\${1:-}" in
+    status) echo "off" ;;
+    *)      : ;;
+esac
+STUB
+chmod +x "$dir/ext-fan.sh"
+mkdir -p "$dir/state"
+
+seq_tick() {
+    local gpu_util="$1"
+    printf '"Device Utilization %%"=%s\n' "$gpu_util" > "$dir/gpu-util.ioreg"
+    run_tick_actuate "$dir" >/dev/null
+}
+
+now=$(date +%s); past=$((now - 70))
+
+# steady cool (already sustained), commanded off
+echo 0 > "$dir/state/hot_since";  echo "$past" > "$dir/state/cool_since"
+echo off > "$dir/state/external_fan_commanded"
+seq_tick "$GPU_IDLE_PCT"
+
+# first hot tick, not yet sustained
+echo 0 > "$dir/state/hot_since"
+seq_tick "$GPU_BUSY_PCT"
+
+# second hot tick: sustained -> the crossing into hot
+echo "$past" > "$dir/state/hot_since"; echo 0 > "$dir/state/cool_since"
+seq_tick "$GPU_BUSY_PCT"
+
+# a further steady-hot tick: nothing should change
+echo "$past" > "$dir/state/hot_since"
+seq_tick "$GPU_BUSY_PCT"
+
+# first cool tick, not yet sustained
+echo 0 > "$dir/state/cool_since"
+seq_tick "$GPU_IDLE_PCT"
+
+# second cool tick: sustained -> the crossing back to cool
+echo "$past" > "$dir/state/cool_since"; echo 0 > "$dir/state/hot_since"
+seq_tick "$GPU_IDLE_PCT"
+
+on_calls=$(grep -x 'on' "$dir/ext-fan-calls.log" 2>/dev/null | wc -l | tr -d ' ')
+off_calls=$(grep -x 'off' "$dir/ext-fan-calls.log" 2>/dev/null | wc -l | tr -d ' ')
+status_calls=$(grep -x 'status' "$dir/ext-fan-calls.log" 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$on_calls" -eq 1 && "$off_calls" -eq 1 && "$status_calls" -eq 0 ]]; then
+    PASS "c: a cool->hot->cool sequence fires on/off exactly once each, no status poll"
+else
+    FAIL "c: crossing calls were on=$on_calls off=$off_calls status=$status_calls (want on=1 off=1 status=0)"
+    echo "--- calls ---"; cat "$dir/ext-fan-calls.log" 2>/dev/null; echo "-------------"
+fi
+
+# ---- Case d: first tick after a fresh start (no commanded-state file at
+# all) with GPU already cool and sustained: at most ONE "off" call (bringing
+# the state from unknown to a known off), then none on a following tick, and
+# never a status poll.
+dir=$(setup_scenario "$GPU_IDLE_PCT" "$QUIET_MW")
+cat > "$dir/ext-fan.sh" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$dir/ext-fan-calls.log"
+case "\${1:-}" in
+    status) echo "off" ;;
+    *)      : ;;
+esac
+STUB
+chmod +x "$dir/ext-fan.sh"
+seed_state "$dir" 0 0
+rm -f "$dir/state/external_fan_commanded"
+run_tick_actuate "$dir" >/dev/null
+run_tick_actuate "$dir" >/dev/null
+off_calls=$(grep -x 'off' "$dir/ext-fan-calls.log" 2>/dev/null | wc -l | tr -d ' ')
+on_calls=$(grep -x 'on' "$dir/ext-fan-calls.log" 2>/dev/null | wc -l | tr -d ' ')
+status_calls=$(grep -x 'status' "$dir/ext-fan-calls.log" 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$off_calls" -le 1 && "$on_calls" -eq 0 && "$status_calls" -eq 0 ]]; then
+    PASS "d: fresh start with GPU cool makes at most one off call, then none"
+else
+    FAIL "d: fresh-start behaviour was off=$off_calls on=$on_calls status=$status_calls (want off<=1 on=0 status=0)"
+    echo "--- calls ---"; cat "$dir/ext-fan-calls.log" 2>/dev/null; echo "-------------"
+fi
+
+echo
+echo "== installer: a config missing hook keys must not abort the install =="
+echo
+
+# ---- Case e: THERMAL_CONF with none of EXTERNAL_ON_CMD/EXTERNAL_OFF_CMD/
+# EXTERNAL_STATUS_CMD/ALERT_CMD set must still install cleanly (rc=0, config
+# copied) - install-thermal-agent.sh's per-key `grep ... || true` guard is
+# what keeps a `set -euo pipefail` script alive through a no-match grep;
+# without it the install aborts partway with the old process left on the
+# stale config. Hermetic: HOME points at a scratch dir, launchctl/sudo are
+# PATH-stubbed to just log, and a fake smcfan build satisfies the installer's
+# smcread/smcfan-ctl guard so it reaches the config-copy step at all. Nothing
+# real is ever installed, loaded, or started.
+install_dir=$(mktemp -d)
+fake_home="$install_dir/home"
+# ~/Library/LaunchAgents always exists on a real Mac; the scratch HOME needs
+# it created explicitly since nothing else in this test populates it.
+mkdir -p "$fake_home/Library/LaunchAgents"
+
+fake_bin="$install_dir/bin"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+echo "launchctl $*" >> "$FAKE_BIN_LOG"
+exit 0
+STUB
+chmod +x "$fake_bin/launchctl"
+cat > "$fake_bin/sudo" <<'STUB'
+#!/usr/bin/env bash
+echo "sudo $*" >> "$FAKE_BIN_LOG"
+"$@"
+STUB
+chmod +x "$fake_bin/sudo"
+
+fake_smcfan_src="$install_dir/smcfan-src"
+mkdir -p "$fake_smcfan_src/Scripts" "$fake_smcfan_src/.build/out/Products/Release"
+printf '#!/usr/bin/env bash\necho stub smcfan-ctl\n' > "$fake_smcfan_src/Scripts/smcfan-ctl"
+chmod +x "$fake_smcfan_src/Scripts/smcfan-ctl"
+printf '#!/usr/bin/env bash\necho stub smcread\n' > "$fake_smcfan_src/.build/out/Products/Release/smcread"
+chmod +x "$fake_smcfan_src/.build/out/Products/Release/smcread"
+
+fake_conf="$install_dir/thermal.conf"
+cat > "$fake_conf" <<'EOF'
+GPU_UTIL_PCT=90
+EOF
+
+installer_out=$(env -i \
+    HOME="$fake_home" \
+    PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    FAKE_BIN_LOG="$install_dir/fake-bin.log" \
+    THERMAL_CONF="$fake_conf" \
+    SMCFAN_SRC="$fake_smcfan_src" \
+        bash "$REPO/install-thermal-agent.sh" 2>&1)
+installer_rc=$?
+
+dest_conf="$fake_home/Library/Application Support/smcfan/thermal/thermal.conf"
+if [[ "$installer_rc" -eq 0 && -f "$dest_conf" ]]; then
+    PASS "e: installer with no hook keys configured exits 0 and copies the config"
+else
+    FAIL "e: installer with no hook keys configured did not complete cleanly (rc=$installer_rc)"
+    echo "--- installer output ---"; echo "$installer_out"; echo "------------------------"
 fi
 
 echo

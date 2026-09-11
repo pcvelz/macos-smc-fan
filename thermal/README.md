@@ -58,13 +58,16 @@ file, for hermetic tests.
   threshold and re-arms only after it is back above for `ALERT_CLEAR_SECONDS`,
   so a benchmark flapping across the threshold cannot re-alert on every brief
   dip.
-- **External-off override:** if the external fan reads `off` while GPU load
-  wants it `on`, the controller re-asserts `on`. It is only logged as
-  `OVERRIDE` (naming an external actor) when the controller's own last
-  commanded state for the fan was `on` - i.e. something else really did flip
-  it off. If the controller itself last commanded `off` (a normal cool-down),
-  the next hot episode turning the fan back on is logged as a plain
-  transition, not an OVERRIDE.
+- **External fan is edge-triggered, never polled:** the tick loop decides
+  purely from what it last commanded (`EXT_FAN_COMMANDED_F`), never from a
+  live `EXTERNAL_STATUS_CMD` read - it acts only when a threshold crossing
+  changes the wanted state, and `EXTERNAL_STATUS_CMD` is never called inside
+  `tick()` at all (it remains a manual-diagnostics hook for `probe`/`reset`
+  only). This matters because the external fan is often a real switch (e.g.
+  a Home Assistant entity) and polling it every tick would spam that backend
+  for no reason. One consequence: a human who flips the switch by hand
+  between crossings is never detected or fought - the manual state sticks
+  until the next real crossing commands the opposite state.
 - **Fail-safe:** an unreadable GPU utilisation read, or a missing/stale CPU
   sidecar log (`PRESSURE_LOG`, >60s old), reads as `UNKNOWN` and the
   controller holds rather than acting. A dead sensor must never look like

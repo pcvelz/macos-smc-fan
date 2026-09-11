@@ -114,7 +114,10 @@ fi
 if [[ -r "$SRC_CONF" ]]; then
   cp "$SRC_CONF" "$DEST_CONF"
   for key in EXTERNAL_ON_CMD EXTERNAL_OFF_CMD EXTERNAL_STATUS_CMD ALERT_CMD; do
-    val=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$SRC_CONF" | tail -1 | sed -E "s/^[^=]*=[[:space:]]*//")
+    # `|| true`: an absent key is normal (every hook is optional), and under
+    # `set -euo pipefail` grep's no-match would otherwise abort the install
+    # before the agent is restarted, leaving the old process on the old config.
+    val=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$SRC_CONF" | tail -1 | sed -E "s/^[^=]*=[[:space:]]*//" || true)
     [[ -z "$val" ]] && continue
     script="${val%% *}"     # first whitespace-delimited token
     [[ -f "$script" ]] || continue
