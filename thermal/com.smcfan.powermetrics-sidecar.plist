@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The powermetrics sidecar: the ONLY source of the GPU/CPU power signal the
+  thermal controller runs on. Install with:
+    bash install-thermal-agent.sh --install-sidecar
+
+  This is a LaunchDaemon, not a LaunchAgent, because powermetrics requires
+  root and most machines have no passwordless sudo - which is also why
+  installing it is the one step that must be run with a password.
+
+  Without it the controller starts, reads UNKNOWN forever and holds by
+  fail-safe: fan control looks installed and does nothing.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.smcfan.powermetrics-sidecar</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/powermetrics</string>
+    <!-- These three samplers are what the controller parses: cpu_power gives
+         "CPU Power: N mW", gpu_power gives "GPU Power: N mW", thermal gives
+         "Current pressure level:". Adding samplers only costs log volume. -->
+    <string>--samplers</string>
+    <string>cpu_power,gpu_power,thermal</string>
+    <!-- 5s cadence against the controller's 15s poll and its 60s staleness
+         window: frequent enough that a fresh sample always exists, cheap
+         enough to leave running forever. -->
+    <string>-i</string>
+    <string>5000</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- powermetrics should never exit; if it does, the controller goes blind
+       and fail-safes to holding, so bring it straight back. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- The controller reads this path. /tmp is deliberate: the signal is
+       ephemeral by design and a reboot should start a fresh log. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/t1-powermetrics-smc.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/t1-powermetrics-sidecar.err</string>
+</dict>
+</plist>

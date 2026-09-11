@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Cold-start the GPU/CPU thermal controller. Install with:
+    bash install-thermal-agent.sh
+
+  Without this the daemon exists only for as long as someone remembers to run
+  a start command, so every reboot silently leaves the machine with no fan
+  control at all.
+
+  PROGRAM PATH IS A COPY, NOT THE REPO. macOS TCC denies a launchd job any
+  read under ~/Documents, so pointing this at a repo checkout under
+  ~/Documents yields status 126 ("Operation not permitted") while still
+  looking installed. The installer copies the scripts to
+  ~/Library/Application Support/smcfan/thermal/ and rewrites the path below -
+  re-run it after ANY change to those scripts.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.smcfan.thermal-controller</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__CONTROLLER__</string>
+    <string>loop</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- The daemon form is an explicit DRY_RUN=0; the script defaults to 1 so a
+         mis-installed agent watches rather than actuates. -->
+    <key>DRY_RUN</key>
+    <string>0</string>
+    <!-- Internal fans: the companion smcfand root daemon in this repo. -->
+    <key>SMCFAN_CTL</key>
+    <string>__SMCFAN_CTL__</string>
+    <!-- The agent's copy of the config file (see install-thermal-agent.sh). -->
+    <key>THERMAL_CONF</key>
+    <string>__THERMAL_CONF__</string>
+  </dict>
+
+  <!-- Start at login. Deliberately NOT KeepAlive: the loop has no exit path
+       of its own, so KeepAlive would only ever fire against a deliberate
+       kill - and stopping the daemon on purpose is exactly that, which
+       launchd would then resurrect within seconds. RunAtLoad fixes the cold
+       start; a deliberate stop stays meaningful. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>__LOGDIR__/thermal-controller-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOGDIR__/thermal-controller-agent.log</string>
+</dict>
+</plist>

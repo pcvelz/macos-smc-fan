@@ -1,0 +1,61 @@
+# thermal.conf - site config for the GPU/CPU-load-driven fan controller.
+#
+# Copy to ~/.config/smcfan/thermal.conf (or point THERMAL_CONF at another
+# path) and edit the values you need. Every key below is optional: a missing
+# key keeps controller.sh's built-in default, and a missing file entirely
+# runs on defaults with the internal fans only. Lines starting with # and
+# blank lines are ignored; unknown keys are reported to stderr and ignored,
+# never silently accepted. This file is parsed line by line, never sourced -
+# only the keys listed here can ever be set from it.
+
+# --- GPU signal --------------------------------------------------------
+# Utilisation percent (from `ioreg -r -c IOGPU -d 1 -f`, "Device Utilization
+# %") above which the GPU is considered hot. Desktop use alone can read well
+# into the 40-70% range on some machines - measure your own idle baseline
+# first (controller.sh probe) and set this comfortably above it.
+GPU_UTIL_PCT=85
+
+# --- CPU signal ----------------------------------------------------------
+# CPU power in mW (from the powermetrics sidecar log) above which the CPU is
+# considered hot. Drives the internal ramp only, never an external fan.
+CPU_LOAD_MW=8000
+
+# --- timing ----------------------------------------------------------------
+POLL_INTERVAL=15            # seconds between ticks in `loop` mode
+ON_SUSTAIN_SECONDS=60        # CPU must stay hot this long before the ramp engages
+OFF_SUSTAIN_SECONDS=30       # either signal must stay cool this long before releasing
+ALERT_AFTER_SECONDS=120      # GPU below threshold this long after being above -> one alert
+ALERT_CLEAR_SECONDS=120      # GPU back above threshold this long before the alert latch re-arms
+
+# --- internal fan curve (smcfand) -------------------------------------------
+SMCFAN_SENSOR=cpu_core_average   # sensor smcfand ramps against
+SMCFAN_MIN_C=45                  # curve floor: min RPM below this temperature
+SMCFAN_MAX_C=75                  # curve ceiling: max RPM at/above this temperature
+# SMCFAN_CTL=/path/to/smcfan-ctl # override; defaults to ../Scripts/smcfan-ctl next to controller.sh
+
+# --- powermetrics sidecar log ------------------------------------------
+# PRESSURE_LOG=/tmp/t1-powermetrics-smc.log
+
+# --- optional external fan --------------------------------------------------
+# Any shell command, run with `bash -c`, no arguments. Leave all three unset
+# to run internal-fans-only - the whole external-fan section of every tick is
+# then skipped outright, not merely a no-op.
+#   EXTERNAL_ON_CMD      turns the external fan on;  must exit 0 on success
+#   EXTERNAL_OFF_CMD     turns the external fan off;  must exit 0 on success
+#   EXTERNAL_STATUS_CMD  prints exactly "on", "off", or "unknown" (optional -
+#                        without it, OVERRIDE detection is skipped and the
+#                        fan's state is taken to be whatever was last
+#                        commanded)
+#
+# EXTERNAL_ON_CMD=/path/to/my-fan-on.sh
+# EXTERNAL_OFF_CMD=/path/to/my-fan-off.sh
+# EXTERNAL_STATUS_CMD=/path/to/my-fan-status.sh
+
+# --- optional cool-dip alert hook -------------------------------------------
+# Run once when the GPU drops back below GPU_UTIL_PCT after a sustained hot
+# episode (see ALERT_AFTER_SECONDS/ALERT_CLEAR_SECONDS above). The event's
+# numbers are passed as env vars: THERMAL_ALERT_COOL_SECONDS,
+# THERMAL_ALERT_GPU_UTIL_PCT, THERMAL_ALERT_FAN, THERMAL_ALERT_HOST. Empty =
+# no hook call, but the log line and the sentinel file are still written.
+#
+# ALERT_CMD=/path/to/my-alert.sh
